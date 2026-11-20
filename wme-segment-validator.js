@@ -6,7 +6,7 @@
 // @supportURL   https://github.com/dinkaftac/wme-segment-validator/issues
 // @updateURL    https://raw.githubusercontent.com/dinkaftac/wme-segment-validator/main/wme-segment-validator.user.js
 // @downloadURL  https://raw.githubusercontent.com/dinkaftac/wme-segment-validator/main/wme-segment-validator.user.js
-// @version      0.12.0
+// @version      0.15.0
 // @description  Segment validator: viewport / managed area / driven area / custom polygon (draw or shapefile), save-triggered re-checks, soft highlights under the roads, clickable error list. Official WME SDK only.
 // @match        https://www.waze.com/*/editor*
 // @match        https://beta.waze.com/*/editor*
@@ -23,7 +23,7 @@
 
   const ID = 'wme-segment-validator';
   const NAME = 'Segment Validator';
-  const VERSION = '0.12.0';
+  const VERSION = '0.15.0';
   const LAYER = 'segment-validator-highlights';
   const HALO_LAYER = 'segment-validator-current';   // halo behind the highlight for the focused segment
   const SCOPE_LAYER = 'segment-validator-scope';
@@ -68,6 +68,7 @@
     rules: {},
     abbrevPattern: '\\b(St|Rd|Ave|Blvd|Dr|Ln|Hwy|Jln)\\.(?=\\s|$)',
     extraWidth: 4,
+    nearMissM: 5,             // loose-end distance in metres (panel setting)
     layerOpacity: 1,
     store: new Map(),         // segmentId -> { id, geometry, mid, rt, hits: [ruleId] }
     visited: new Set(),
@@ -324,7 +325,7 @@
       for (const t of near(c, p)) {
         if (t.id === s.id || (t.elevationLevel ?? 0) !== (s.elevationLevel ?? 0)) continue;
         const dist = distPointToLineM(p, t.geometry.coordinates);
-        if (dist < 10) { // Increased from 5 to 10 meters
+        if (dist < state.nearMissM) {
           if (!nmLogged.has(s.id)) { nmLogged.add(s.id); log.info(`NEAR_MISS: segment ${s.id} endpoint is ${Math.round(dist)}m from segment ${t.id}`); }
           return true;
         }
@@ -480,7 +481,7 @@
         (s.isBtoA && !others(c, s, s.toNodeId).some(t => t.isDrivable && arrives(t, s.toNodeId)))) },
     { id: 'UNNEEDED_NODE', cat: 'topology', sev: 'topology', on: true, label: 'Unneeded node: 2 identical segments, remove 1 node',
       test: straightNode },
-    { id: 'NEAR_MISS', cat: 'topology', sev: 'error', on: false, slow: true, label: 'Loose end within 10 m of another road',
+    { id: 'NEAR_MISS', cat: 'topology', sev: 'error', on: false, slow: true, label: 'Loose end close to another road (distance in panel)',
       test: nearMiss },
     { id: 'OVERLAP', cat: 'topology', sev: 'warning', on: false, slow: true, label: 'Overlapping segments (same elevation)',
       test: overlap },
@@ -535,7 +536,7 @@
   const SETTINGS_KEY = 'wme-segment-validator:settings:v1';
   const POLY_KEY = 'wme-segment-validator:polygons:v1';
   const PERSIST = ['enabled', 'autoMove', 'highlightOnly', 'autoSave', 'accumulate', 'loadMP', 'limitToViewport', 'abbrevPattern',
-    'extraWidth', 'layerOpacity', 'filterSev', 'filterRule', 'sortBy', 'hideVisited', 'zoomTo', 'selectOnJump', 'sweepZoom', 'bgEnabled'];
+    'extraWidth', 'nearMissM', 'layerOpacity', 'filterSev', 'filterRule', 'sortBy', 'hideVisited', 'zoomTo', 'selectOnJump', 'sweepZoom', 'bgEnabled'];
   let savedAreaKey = 'viewport';
   const kv = {
     get(k) { try { const t = localStorage.getItem(k); return t ? JSON.parse(t) : null; } catch (e) { return null; } },
@@ -558,6 +559,7 @@
     state.zoomTo = Math.min(30, Math.max(1, Number(state.zoomTo) || 17));
     state.sweepZoom = Math.min(17, Math.max(12, Number(state.sweepZoom) || 14));
     state.layerOpacity = Math.min(1, Math.max(0.2, Number(state.layerOpacity) || 1));
+    state.nearMissM = Math.min(30, Math.max(1, Number(state.nearMissM) || 5));
     state.extraWidth = Math.min(20, Math.max(0, Number(state.extraWidth) || 0));
     const polys = kv.get(POLY_KEY);
     if (Array.isArray(polys)) polys.forEach(pl => { try { if (pl && pl.geometry && pl.geometry.coordinates) state.polygons.push(mkArea(pl.geometry, String(pl.name || 'Polygon'))); } catch (e) { /* skip bad entry */ } });
@@ -806,6 +808,8 @@
     state.limitToViewport = true; state.accumulate = true;
     ui.sweepBtn.textContent = 'Stop sweep';
     ui.pauseBtn.disabled = false;
+    let home = null;                                  // where the map was before the sweep, restored when it ends
+    try { home = { c: await sdk.Map.getMapCenter(), z: await sdk.Map.getZoomLevel() }; } catch (e) { /* no restore */ }
     try {
       await sdk.Map.setMapCenter({ lonLat: areaCenter(areas[0]), zoomLevel: z });
       await settle();
@@ -843,7 +847,10 @@
       if (ui.sweepBar && !stopped) ui.sweepBar.firstChild.style.width = '100%';
       await refreshView();
       setStatus(`Sweep ${stopped ? 'stopped' : 'done'} in ${mmss(Date.now() - tStart - pausedMs)} · ${state.view.length} issues`);
-    } finally { endSweep(); }
+    } finally {
+      endSweep();
+      if (home) { try { await sdk.Map.setMapCenter({ lonLat: home.c, zoomLevel: home.z }); } catch (e) { log.warn('restore view after sweep', e); } }
+    }
   }
   async function withPermission(cands) {
     const keep = [];
@@ -1440,6 +1447,11 @@
         boxes.push(cb);
         body.append(h('label', { style: 'display:block;font-size:12px' }, cb, ' ',
           h('span', { textContent: '\u25CF ', style: `color:${PALETTE[TIER[r.sev]]}` }), r.label + (r.slow ? ' (slow)' : '')));
+        if (r.id === 'NEAR_MISS') {
+          const nm = h('input', { type: 'number', min: 1, max: 30, step: 1, value: state.nearMissM, style: 'width:48px' });
+          nm.onchange = () => { state.nearMissM = Math.min(30, Math.max(1, Number(nm.value) || 5)); nm.value = state.nearMissM; nmLogged.clear(); if (state.rules.NEAR_MISS) run(); };
+          body.append(h('div', { style: 'margin:2px 0 4px 18px;font-size:11px' }, 'Distance (m): ', nm, ' (1-30)'));
+        }
         if (r.id === 'ABBREV') {
           const inp = h('input', { type: 'text', value: state.abbrevPattern, style: 'width:95%;font:11px monospace;margin:2px 0 4px 18px' });
           inp.onchange = () => { state.abbrevPattern = inp.value; run(); };
@@ -1506,6 +1518,7 @@
       ui.pauseBtn.textContent = state.sweepPaused ? 'Resume' : 'Pause';
       if (state.sweepPaused) setStatus('Pausing after the current screen...');
     }, { disabled: true });
+    ui.nudgeBtn = mkBtn('Refresh map', () => nudgeMap('button'));
     ui.sweepBar = h('div', { style: 'height:6px;background:#e0e0e0;border-radius:3px;margin:4px 0;overflow:hidden' }, h('div', { style: 'height:6px;width:0;background:#1e88e5' }));
     ui.scanBtn = mkBtn('Scan Now', () => scan({ force: true }).catch(onScanError), { style: 'font-weight:bold;padding:3px 10px' });
     ui.status = h('div', { style: 'margin:6px 0;color:#555;font-size:12px;min-height:30px' });
@@ -1570,7 +1583,7 @@
         for (const layerName of [LAYER, HALO_LAYER, SCOPE_LAYER, MP_LAYER]) await sdk.Map.setLayerVisibility({ layerName, visibility: v });
         if (v) run();
       }),
-      h('div', { style: 'margin-top:4px' }, 'Area: ', ui.area), h('div', { style: 'margin-top:4px' }, drawBtn, ' ', importBtn, ' ', clearPolyBtn, ' ', ui.sweepBtn, ' ', ui.pauseBtn, ' zoom ', ui.zoomSweep), ui.sweepBar, ui.file, ui.scopeNote,
+      h('div', { style: 'margin-top:4px' }, 'Area: ', ui.area), h('div', { style: 'margin-top:4px' }, drawBtn, ' ', importBtn, ' ', clearPolyBtn, ' ', ui.sweepBtn, ' ', ui.pauseBtn, ' ', ui.nudgeBtn, ' zoom ', ui.zoomSweep), ui.sweepBar, ui.file, ui.scopeNote,
       mkCheck('Limit to screen viewport (area scopes)', state.limitToViewport, v => { state.limitToViewport = v; run(); }),
       mkCheck('Include Waze map problems (shows WME\'s Map Problems layer so they load)', state.loadMP, async v => {
         state.loadMP = v;
@@ -1599,6 +1612,27 @@
   const onScanError = e => { log.error('scan failed', e); setStatus('Scan error, copy the debug log'); };
   let run = () => {};
   const on = (eventName, eventHandler) => { const off = sdk.Events.on({ eventName, eventHandler }); if (typeof off === 'function') offs.push(off); };
+
+  // After a laptop sleep / tab switch WME can leave the map blank until the view moves. A tiny pan-and-back makes it refetch tiles.
+  async function nudgeMap(why) {
+    try {
+      const [c, z, ext] = await Promise.all([sdk.Map.getMapCenter(), sdk.Map.getZoomLevel(), sdk.Map.getMapExtent()]);
+      const area = areasForKey()[0];
+      // jump to the selected area (it has roads) so WME fetches fresh data; with no area, pan one screen away instead
+      const away = area ? areaCenter(area) : { lon: c.lon + (Array.isArray(ext) ? Math.abs(ext[2] - ext[0]) : 0.01 || 0.01), lat: c.lat };
+      await sdk.Map.setMapCenter({ lonLat: away, zoomLevel: Math.max(z, 13) });
+      const t0 = Date.now();
+      await sleep(500);
+      while (Date.now() - t0 < 8000 && await sdk.State.isMapLoading()) await sleep(200);
+      await sdk.Map.setMapCenter({ lonLat: { lon: c.lon, lat: c.lat }, zoomLevel: z });
+      log.info(`map nudged (${why}) via ${area ? 'area centre' : 'one-screen pan'}, ${Date.now() - t0}ms`);
+    } catch (e) { log.warn('map nudge failed', e); }
+  }
+  let hiddenAt = 0;
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) { hiddenAt = Date.now(); return; }
+    if (hiddenAt && Date.now() - hiddenAt > 20000 && !state.sweeping || (hiddenAt && state.sweepPaused)) nudgeMap('page visible again');
+  });
 
   async function placeBelowRoads() {
     const names = [];
