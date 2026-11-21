@@ -6,7 +6,7 @@
 // @supportURL   https://github.com/dinkaftac/wme-segment-validator/issues
 // @updateURL    https://raw.githubusercontent.com/dinkaftac/wme-segment-validator/main/wme-segment-validator.user.js
 // @downloadURL  https://raw.githubusercontent.com/dinkaftac/wme-segment-validator/main/wme-segment-validator.user.js
-// @version      0.17.0
+// @version      0.18.0
 // @description  Segment validator: viewport / managed area / driven area / custom polygon (draw or shapefile), save-triggered re-checks, soft highlights under the roads, clickable error list. Official WME SDK only.
 // @match        https://www.waze.com/*/editor*
 // @match        https://beta.waze.com/*/editor*
@@ -23,7 +23,7 @@
 
   const ID = 'wme-segment-validator';
   const NAME = 'Segment Validator';
-  const VERSION = '0.17.0';
+  const VERSION = '0.18.0';
   const LAYER = 'segment-validator-highlights';
   const HALO_LAYER = 'segment-validator-current';   // halo behind the highlight for the focused segment
   const SCOPE_LAYER = 'segment-validator-scope';
@@ -298,6 +298,15 @@
     const ct = c.cities.get(st.cityId);
     return !!(ct && !ct.isEmpty && ct.name);
   };
+  const stateMissing = (st, c) => {                 // the street's city has no state (or an empty one)
+    if (!st || st.cityId == null) return false;
+    const ct = c.cities.get(st.cityId);
+    if (!ct || !('stateId' in ct)) return false;     // the SDK did not expose stateId: unknown, do not guess
+    if (ct.stateId == null) return true;
+    const stt = c.states.get(ct.stateId);
+    return !!stt && (stt.isEmpty === true || !String(stt.name || '').trim());
+  };
+  let cityShapeLogged = false;
   const clsOf = s => CLASS[s.roadType] || 0;
 
   const GRID = 0.0003;                              // ~33 m cells
@@ -347,6 +356,32 @@
     }
     return false;
   }
+  const norm180 = a => ((a % 360) + 540) % 360 - 180;
+  // Waze median U-turn prevention: turn in (A), ONE short median segment (B), turn out (C), A and C about parallel (turns add up to ~180 degrees).
+  // Waze then adds a huge penalty and the U-turn is effectively never routed. A median of 16 m or more always allows it.
+  // Cutting the median into two segments (an extra node in the middle) switches the penalty off, so such medians are not flagged.
+  function medianUturn(s, c) {
+    if (!s.isDrivable || s.junctionId != null || s.fromNodeId == null || s.toNodeId == null || s.fromNodeId === s.toNodeId) return false;
+    if (!(s.length > 0 && s.length < 16) || s.geometry.coordinates.length < 2) return false;
+    const dirs = [];
+    if (fwdOpen(s)) dirs.push([s.fromNodeId, s.toNodeId]);
+    if (revOpen(s)) dirs.push([s.toNodeId, s.fromNodeId]);
+    const lvl = x => x.elevationLevel ?? 0;
+    for (const [n1, n2] of dirs) {
+      const hB = bearingAway(s, n1);
+      for (const a of others(c, s, n1)) {
+        if (!a.isDrivable || !arrives(a, n1) || lvl(a) !== lvl(s) || a.geometry.coordinates.length < 2) continue;
+        const t1 = norm180(hB - (bearingAway(a, n1) + 180));
+        for (const k of others(c, s, n2)) {
+          if (!k.isDrivable || k.id === a.id || !leaves(k, n2) || lvl(k) !== lvl(s) || k.geometry.coordinates.length < 2) continue;
+          const t2 = norm180(bearingAway(k, n2) - hB);
+          const sum = Math.abs(t1 + t2);
+          if (t1 * t2 > 0 && sum >= 175 && sum <= 185) return true;
+        }
+      }
+    }
+    return false;
+  }
   function straightNode(s, c) {                     // node with exactly two identical segments: node adds nothing
     if (!s.isDrivable || s.junctionId != null) return false;
     return ends(s).some(n => {
@@ -381,7 +416,7 @@
     return map;
   }
   async function buildContext(all) {
-    const c = { seg: new Map(), nodes: new Map(), pairs: new Map(), streets: new Map(), cities: new Map(), _grid: null };
+    const c = { seg: new Map(), nodes: new Map(), pairs: new Map(), streets: new Map(), cities: new Map(), states: new Map(), _grid: null };
     const streetIds = new Set();
     for (const s of all) {
       c.seg.set(s.id, s);
@@ -398,6 +433,8 @@
       c.streets = await loadById(sdk.DataModel.Streets, 'streetId', streetIds);
       const cityIds = new Set([...c.streets.values()].map(st => st.cityId).filter(i => i != null));
       c.cities = await loadById(sdk.DataModel.Cities, 'cityId', cityIds);
+      if (state.rules.NO_STATE) try { (await sdk.DataModel.States.getAll()).forEach(x => c.states.set(x.id, x)); } catch (e) { warnOnce('states-getAll', e); }
+      if (!cityShapeLogged && c.cities.size) { cityShapeLogged = true; const x = [...c.cities.values()][0]; log.info(`city sample keys: ${Object.keys(x).join(',')} stateId=${x.stateId}`); }
     }
     c.nodeRec = new Map(); c.nodeApi = false;       // WME's own node records list every segment on the node, loaded or not
     if (needNodes) try {
@@ -433,11 +470,13 @@
     ['continuity', 'Type Continuity'], ['restrictions', 'Restrictions & Closures'], ['server', 'Waze Map Problems (reported by drivers)']];
   const RULES = [
     // --- Waze map problems (server side, point located; matched to segments within 25 m)
-    { id: 'MP_OPEN', cat: 'server', sev: 'warning', on: true, label: 'Open Waze map problem at this segment',
+    { id: 'MP_OPEN', cat: 'server', sev: 'error', on: true, label: 'Open Waze map problem at this segment',
       test: (s, c) => (c.mp.get(s.id) || []).length > 0 },
     // --- Missing info & naming
     { id: 'NO_NAME', cat: 'info', sev: 'warning', on: true, label: 'No street name',
       test: (s, c) => NAMED_TYPES.has(s.roadType) && s.junctionId == null && !nameOf(s, c) },
+    { id: 'NO_STATE', cat: 'info', sev: 'warning', on: true, label: 'City has no state',
+      test: (s, c) => NAMED_TYPES.has(s.roadType) && !!nameOf(s, c) && cityOk(streetOf(s, c), c) && stateMissing(streetOf(s, c), c) },
     { id: 'NO_CITY', cat: 'info', sev: 'warning', on: true, label: 'No city',
       test: (s, c) => NAMED_TYPES.has(s.roadType) && !!nameOf(s, c) && !cityOk(streetOf(s, c), c) },
     { id: 'LOWERCASE', cat: 'info', sev: 'note', on: true, label: 'Street name starts lowercase',
@@ -455,6 +494,8 @@
       test: s => s.isDrivable && !s.allowNoDirection && !s.isTwoWay && !s.isAtoB && !s.isBtoA },
     { id: 'SHORT', cat: 'geometry', sev: 'warning', on: true, label: 'Shorter than 5 m (not a dead end)',
       test: (s, c) => s.isDrivable && s.junctionId == null && s.length < 5 && at(c, s.fromNodeId).length > 1 && at(c, s.toNodeId).length > 1 },
+    { id: 'MEDIAN_UTURN', cat: 'geometry', sev: 'warning', on: true, label: 'Median U-turn too short: one median segment under 16 m',
+      test: medianUturn },
     { id: 'TWOWAY_FWY', cat: 'geometry', sev: 'error', on: true, label: 'Two-way Freeway / Ramp',
       test: s => s.isTwoWay && (s.roadType === 3 || s.roadType === 4) },
     { id: 'ELEV_FWY', cat: 'geometry', sev: 'note', on: true, label: 'Freeway not at ground level',
@@ -610,8 +651,8 @@
   function abbrevRe() { try { return state.abbrevPattern ? new RegExp(state.abbrevPattern) : null; } catch (e) { warnOnce('abbrev-regex', e); return null; } }
   const worst = ids => ids.reduce((a, id) => (RANK[TIER[RULE_BY_ID[id].sev]] > RANK[a] ? TIER[RULE_BY_ID[id].sev] : a), 'note');
 
-  const NAME_RULES = new Set(['NO_NAME', 'NO_CITY', 'LOWERCASE', 'ABBREV', 'EMPTY_ALT', 'NAME_ROUNDABOUT', 'CLOSED_NAME', 'CITY_RAIL_FWY']);
-  const NEIGHBOUR_RULE = r => (r.cat === 'topology' && r.id !== 'LOOP') || r.cat === 'continuity';
+  const NAME_RULES = new Set(['NO_NAME', 'NO_CITY', 'NO_STATE', 'LOWERCASE', 'ABBREV', 'EMPTY_ALT', 'NAME_ROUNDABOUT', 'CLOSED_NAME', 'CITY_RAIL_FWY']);
+  const NEIGHBOUR_RULE = r => (r.cat === 'topology' && r.id !== 'LOOP') || r.cat === 'continuity' || r.id === 'MEDIAN_UTURN';
   function neighboursLoaded(s, c) {                 // every segment on both end nodes is in the data model
     if (!c.nodeApi) return true;
     for (const n of new Set(ends(s))) {
@@ -643,7 +684,7 @@
       out.set(s.id, hits);
     }
     state.skip = { nb: skipNb, nm: skipNm };
-    if (state.rules.NO_NAME || state.rules.NO_CITY) await addressPass(cands, out);
+    if (state.rules.NO_NAME || state.rules.NO_CITY || state.rules.NO_STATE) await addressPass(cands, out);
     if (state.rules.UTURN_DEAD_END) await uturnPass(cands, ctx, out);
     if (state.rules.LOCKED_ABOVE_RANK) await permissionPass(cands, out);
     return out;
@@ -651,7 +692,7 @@
 
   let addrLogged = false;
   async function addressPass(cands, out) {          // WME's own resolved address is the final word on missing name / city
-    const todo = cands.filter(s => { const h = out.get(s.id); return h && (h.includes('NO_NAME') || h.includes('NO_CITY')); });
+    const todo = cands.filter(s => { const h = out.get(s.id); return h && (h.includes('NO_NAME') || h.includes('NO_CITY') || h.includes('NO_STATE')); });
     for (let i = 0; i < todo.length; i += 40) {
       await Promise.all(todo.slice(i, i + 40).map(async s => {
         try {
@@ -661,7 +702,9 @@
           const ct = a && ((a.city && a.city.name) || a.cityName);
           let hits = out.get(s.id);
           if (nm) hits = hits.filter(x => x !== 'NO_NAME');
+          const stt = a && ((a.state && a.state.name) || a.stateName);
           if (ct) hits = hits.filter(x => x !== 'NO_CITY');
+          if (stt) hits = hits.filter(x => x !== 'NO_STATE');
           out.set(s.id, hits);
         } catch (e) { warnOnce('getAddress', e); }
       }));
@@ -1295,7 +1338,7 @@
       `${pts.length} open map problems` + (pts.length ? ': ' + Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ×${v}`).join(', ') : '') }));
     pts.sort((a, b) => String(mpName(a)).localeCompare(mpName(b)) || a.id - b.id).slice(0, 500).forEach(o => {
       const row = h('div', { textContent: `#${o.id}  ${mpName(o)}`, title: 'Click to go there',
-        style: 'padding:3px 4px;border-left:6px solid #d81b60;border-bottom:1px solid #eee;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis' });
+        style: 'padding:3px 4px;border-left:6px solid #e53935;border-bottom:1px solid #eee;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis' });
       row.onclick = async () => {
         if (state.highlightOnly) return;
         try {
@@ -1448,7 +1491,7 @@
     for (const r of rows) {
       const sevKey = Object.keys(SEV_NAME).find(k => SEV_NAME[k].startsWith(r.severity));
       const tr = mk('tr', { className: r.e ? 'r' : '' },
-        mk('td', {}, mk('span', { className: 'sev', textContent: r.severity, style: `background:${sevKey ? PALETTE[sevKey] : '#d81b60'}` })),
+        mk('td', {}, mk('span', { className: 'sev', textContent: r.severity, style: `background:${sevKey ? PALETTE[sevKey] : '#e53935'}` })),
         mk('td', { textContent: r.segment_id }), mk('td', { textContent: r.issues }), mk('td', { textContent: r.road_type }),
         mk('td', { textContent: `${r.lon}, ${r.lat}` }));
       if (r.e) tr.onclick = () => goTo(r.e);
@@ -1654,7 +1697,7 @@
       mkBtn('Reset saved settings', () => { kv.del(SETTINGS_KEY); kv.del(POLY_KEY); kv.del(RESULTS_KEY); clearTimeout(persistTimer); persistTimer = 0; state.areasReady = false; setStatus('Saved settings cleared. Reload the page to start from defaults.'); }));
 
     ui.bgBtn = mkBtn('Scan map problems', () => bgScan().catch(e => { log.error('bgScan', e); bg.running = false; }), { disabled: !state.bgEnabled });
-    ui.bgBar = h('div', { style: 'height:6px;background:#e0e0e0;border-radius:3px;margin:4px 0;overflow:hidden' }, h('div', { style: 'height:6px;width:0;background:#d81b60' }));
+    ui.bgBar = h('div', { style: 'height:6px;background:#e0e0e0;border-radius:3px;margin:4px 0;overflow:hidden' }, h('div', { style: 'height:6px;width:0;background:#e53935' }));
     ui.bgStatus = h('div', { style: 'font-size:12px;color:#555' });
     ui.mpList = h('div', { style: 'position:relative;max-height:260px;overflow:auto;font-size:12px;border:1px solid #ddd;margin-top:4px' });
     const mpSection = section('Map problems, background (unofficial)', false,
@@ -1768,7 +1811,7 @@
     await sdk.Map.addLayer({
       layerName: MP_LAYER,
       styleContext: { getTip: ({ feature }) => (feature && feature.properties && feature.properties.tip) || '' },
-      styleRules: [{ style: { pointRadius: 9, fillColor: '#d81b60', fillOpacity: 0.85, strokeColor: '#ffffff', strokeWidth: 2, title: '${getTip}' } }],
+      styleRules: [{ style: { pointRadius: 9, fillColor: '#e53935', fillOpacity: 0.85, strokeColor: '#ffffff', strokeWidth: 2, title: '${getTip}' } }],
     });
     await sdk.Map.addLayer({
       layerName: HALO_LAYER,
