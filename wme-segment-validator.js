@@ -6,7 +6,7 @@
 // @supportURL   https://github.com/dinkaftac/wme-segment-validator/issues
 // @updateURL    https://raw.githubusercontent.com/dinkaftac/wme-segment-validator/main/wme-segment-validator.user.js
 // @downloadURL  https://raw.githubusercontent.com/dinkaftac/wme-segment-validator/main/wme-segment-validator.user.js
-// @version      0.18.0
+// @version      0.20.0
 // @description  Segment validator: viewport / managed area / driven area / custom polygon (draw or shapefile), save-triggered re-checks, soft highlights under the roads, clickable error list. Official WME SDK only.
 // @match        https://www.waze.com/*/editor*
 // @match        https://beta.waze.com/*/editor*
@@ -23,7 +23,7 @@
 
   const ID = 'wme-segment-validator';
   const NAME = 'Segment Validator';
-  const VERSION = '0.18.0';
+  const VERSION = '0.20.0';
   const LAYER = 'segment-validator-highlights';
   const HALO_LAYER = 'segment-validator-current';   // halo behind the highlight for the focused segment
   const SCOPE_LAYER = 'segment-validator-scope';
@@ -164,7 +164,7 @@
       ['DataModel.Streets', dm.Streets, ['getAll', 'getById']],
       ['DataModel.Cities', dm.Cities, ['getAll', 'getById']],
       ['DataModel.ManagedAreas', dm.ManagedAreas, ['getById', 'getAll']],
-      ['DataModel.Turns', dm.Turns, ['getTurnsFromSegment']],
+      ['DataModel.Turns', dm.Turns, ['getTurnsFromSegment', 'isTurnAllowed']],
       ['Editing', sdk.Editing, ['setSelection']],
       ['Sidebar', sdk.Sidebar, ['registerScriptTab']],
       ['Events', sdk.Events, ['on', 'once']],
@@ -230,14 +230,33 @@
   const bboxHit = (p, q) => p[0] <= q[2] && p[2] >= q[0] && p[1] <= q[3] && p[3] >= q[1];
   const segBBox = s => bboxOfCoords(s.geometry.coordinates);
   const mkArea = (geometry, name) => ({ geometry, name, bbox: bboxOfCoords(geometry.coordinates[0]) });
-  const segInArea = (s, area) => {
-    if (!bboxHit(segBBox(s), area.bbox)) return false;
-    // Check if any vertex is inside
-    if (s.geometry.coordinates.some(pt => polygonContains(pt, area.geometry))) return true;
-    // Check midpoint for crossing segments
-    const mid = lineMidpoint(s.geometry.coordinates);
-    return polygonContains(mid, area.geometry);
-  };
+  // A segment belongs to an area if any vertex is inside, any point sampled every ~50 m along it is inside,
+  // or it crosses the area's outer border (catches long segments that cut a corner with no vertex inside).
+  function segmentsCross(a, b, c, d) {
+    const d1 = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+    const d2 = (b[0] - a[0]) * (d[1] - a[1]) - (b[1] - a[1]) * (d[0] - a[0]);
+    const d3 = (d[0] - c[0]) * (a[1] - c[1]) - (d[1] - c[1]) * (a[0] - c[0]);
+    const d4 = (d[0] - c[0]) * (b[1] - c[1]) - (d[1] - c[1]) * (b[0] - c[0]);
+    return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
+  }
+  function lineCrossesPolygon(coords, poly) {
+    if (coords.some(pt => polygonContains(pt, poly))) return true;
+    for (let i = 1; i < coords.length; i++) {
+      const [x1, y1] = coords[i - 1], [x2, y2] = coords[i];
+      const k = Math.cos(((y1 + y2) / 2) * Math.PI / 180);
+      const lenM = Math.hypot((x2 - x1) * 111320 * k, (y2 - y1) * 110540);
+      const n = Math.max(1, Math.min(64, Math.ceil(lenM / 50)));
+      for (let j = 1; j < n; j++) {
+        const t = j / n;
+        if (polygonContains([x1 + (x2 - x1) * t, y1 + (y2 - y1) * t], poly)) return true;
+      }
+    }
+    const ring = poly.coordinates[0];
+    for (let i = 1; i < coords.length; i++)
+      for (let j = 1; j < ring.length; j++) if (segmentsCross(coords[i - 1], coords[i], ring[j - 1], ring[j])) return true;
+    return false;
+  }
+  const segInArea = (s, area) => bboxHit(segBBox(s), area.bbox) && lineCrossesPolygon(s.geometry.coordinates, area.geometry);
 
   function lineMidpoint(coords) {
     if (coords.length < 2) return coords[0];
@@ -360,9 +379,10 @@
   // Waze median U-turn prevention: turn in (A), ONE short median segment (B), turn out (C), A and C about parallel (turns add up to ~180 degrees).
   // Waze then adds a huge penalty and the U-turn is effectively never routed. A median of 16 m or more always allows it.
   // Cutting the median into two segments (an extra node in the middle) switches the penalty off, so such medians are not flagged.
-  function medianUturn(s, c) {
-    if (!s.isDrivable || s.junctionId != null || s.fromNodeId == null || s.toNodeId == null || s.fromNodeId === s.toNodeId) return false;
-    if (!(s.length > 0 && s.length < 16) || s.geometry.coordinates.length < 2) return false;
+  function medianTriples(s, c) {                    // every in-segment / out-segment pair that makes a U-turn over this median segment
+    const found = [];
+    if (!s.isDrivable || s.junctionId != null || s.fromNodeId == null || s.toNodeId == null || s.fromNodeId === s.toNodeId) return found;
+    if (!(s.length > 0 && s.length < 16) || s.geometry.coordinates.length < 2) return found;
     const dirs = [];
     if (fwdOpen(s)) dirs.push([s.fromNodeId, s.toNodeId]);
     if (revOpen(s)) dirs.push([s.toNodeId, s.fromNodeId]);
@@ -376,12 +396,13 @@
           if (!k.isDrivable || k.id === a.id || !leaves(k, n2) || lvl(k) !== lvl(s) || k.geometry.coordinates.length < 2) continue;
           const t2 = norm180(bearingAway(k, n2) - hB);
           const sum = Math.abs(t1 + t2);
-          if (t1 * t2 > 0 && sum >= 175 && sum <= 185) return true;
+          if (t1 * t2 > 0 && sum >= 175 && sum <= 185) found.push({ aId: a.id, n1, n2, kId: k.id });
         }
       }
     }
-    return false;
+    return found;
   }
+  function medianUturn(s, c) { return medianTriples(s, c).length > 0; }
   function straightNode(s, c) {                     // node with exactly two identical segments: node adds nothing
     if (!s.isDrivable || s.junctionId != null) return false;
     return ends(s).some(n => {
@@ -415,7 +436,7 @@
     }
     return map;
   }
-  async function buildContext(all) {
+  async function buildContext(all, cands = all) {      // cands: the segments that will be checked; names are looked up for those only
     const c = { seg: new Map(), nodes: new Map(), pairs: new Map(), streets: new Map(), cities: new Map(), states: new Map(), _grid: null };
     const streetIds = new Set();
     for (const s of all) {
@@ -424,6 +445,8 @@
       if (s.isDrivable && s.fromNodeId != null && s.toNodeId != null && s.fromNodeId !== s.toNodeId) {
         const k = pairKey(s); c.pairs.set(k, (c.pairs.get(k) || 0) + 1);
       }
+    }
+    for (const s of cands) {
       if (s.primaryStreetId != null) streetIds.add(s.primaryStreetId);
       (s.alternateStreetIds || []).forEach(i => streetIds.add(i));
     }
@@ -529,10 +552,6 @@
       test: nearMiss },
     { id: 'OVERLAP', cat: 'topology', sev: 'warning', on: false, slow: true, label: 'Overlapping segments (same elevation)',
       test: overlap },
-    { id: 'UNVERIFIED_SPEED', cat: 'info', sev: 'warning', on: true, label: 'Unverified speed limit',
-      test: s => s.isDrivable && SPEED_TYPES.has(s.roadType) &&
-        ((fwdOpen(s) && s.fwdSpeedLimit != null && !s.isFwdSpeedLimitVerified) ||
-         (revOpen(s) && s.revSpeedLimit != null && !s.isRevSpeedLimitVerified)) },
     { id: 'UTURN_DEAD_END', cat: 'topology', sev: 'topology', on: false, slow: true, async: true, label: 'U-turn enabled at dead end',
       test: () => false },
     // --- Type continuity (heuristics on road class)
@@ -559,11 +578,7 @@
       } },
     // --- Restrictions & closures
     { id: 'EXPIRED_RESTR', cat: 'restrictions', sev: 'warning', on: true, label: 'Expired restriction',
-      test: s => s.hasRestrictions && (s.restrictions || []).some(r => {
-        const e = r && (r.endDate ?? r.endDateTime ?? r.toDate);
-        const t = e ? Date.parse(e) : NaN;
-        return Number.isFinite(t) && t < Date.now();
-      }) },
+      test: s => s.hasRestrictions && (s.restrictions || []).some(r => r && r.isExpired === true) },   // SDK: SegmentRestriction.isExpired
     { id: 'HAS_RESTR', cat: 'restrictions', sev: 'info', on: false, label: 'Has restrictions',
       test: s => s.hasRestrictions },
     { id: 'HAS_CLOSURE', cat: 'restrictions', sev: 'info', on: false, label: 'Has closures',
@@ -685,54 +700,72 @@
     }
     state.skip = { nb: skipNb, nm: skipNm };
     if (state.rules.NO_NAME || state.rules.NO_CITY || state.rules.NO_STATE) await addressPass(cands, out);
+    if (state.rules.MEDIAN_UTURN) await medianTurnPass(cands, ctx, out);
     if (state.rules.UTURN_DEAD_END) await uturnPass(cands, ctx, out);
     if (state.rules.LOCKED_ABOVE_RANK) await permissionPass(cands, out);
     return out;
   }
 
+  async function pool(items, limit, fn) {            // run fn over items with at most `limit` calls in flight
+    let i = 0;
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (i < items.length) { const k = i++; try { await fn(items[k], k); } catch (e) { warnOnce('pool', e); } }
+    }));
+  }
   let addrLogged = false;
-  async function addressPass(cands, out) {          // WME's own resolved address is the final word on missing name / city
+  async function addressPass(cands, out) {          // WME's own resolved address is the final word on missing name / city / state
     const todo = cands.filter(s => { const h = out.get(s.id); return h && (h.includes('NO_NAME') || h.includes('NO_CITY') || h.includes('NO_STATE')); });
-    for (let i = 0; i < todo.length; i += 40) {
-      await Promise.all(todo.slice(i, i + 40).map(async s => {
+    await pool(todo, 8, async s => {
+      try {
+        const a = await sdk.DataModel.Segments.getAddress({ segmentId: s.id });
+        if (!addrLogged) { addrLogged = true; log.info(`getAddress sample: ${fmt(a).slice(0, 600)}`); }
+        const nm = a && ((a.street && a.street.name) || a.streetName);
+        const ct = a && ((a.city && a.city.name) || a.cityName);
+        const stt = a && ((a.state && a.state.name) || a.stateName);
+        let hits = out.get(s.id);
+        if (nm) hits = hits.filter(x => x !== 'NO_NAME');
+        if (ct) hits = hits.filter(x => x !== 'NO_CITY');
+        if (stt) hits = hits.filter(x => x !== 'NO_STATE');
+        out.set(s.id, hits);
+      } catch (e) { warnOnce('getAddress', e); }
+    });
+  }
+  async function medianTurnPass(cands, ctx, out) {  // keep a median U-turn flag only if WME says both turns are really allowed (a blocked turn means no U-turn anyway)
+    const T = sdk.DataModel.Turns;
+    if (!T || typeof T.isTurnAllowed !== 'function') return warnOnce('median-turns', 'Turns.isTurnAllowed missing: median U-turn flags are not filtered by turn permissions');
+    const todo = cands.filter(s => (out.get(s.id) || []).includes('MEDIAN_UTURN'));
+    await pool(todo, 8, async s => {
+      let allowed = false, known = false;
+      for (const t of medianTriples(s, ctx)) {
         try {
-          const a = await sdk.DataModel.Segments.getAddress({ segmentId: s.id });
-          if (!addrLogged) { addrLogged = true; log.info(`getAddress sample: ${fmt(a).slice(0, 600)}`); }
-          const nm = a && ((a.street && a.street.name) || a.streetName);
-          const ct = a && ((a.city && a.city.name) || a.cityName);
-          let hits = out.get(s.id);
-          if (nm) hits = hits.filter(x => x !== 'NO_NAME');
-          const stt = a && ((a.state && a.state.name) || a.stateName);
-          if (ct) hits = hits.filter(x => x !== 'NO_CITY');
-          if (stt) hits = hits.filter(x => x !== 'NO_STATE');
-          out.set(s.id, hits);
-        } catch (e) { warnOnce('getAddress', e); }
-      }));
-    }
+          const r1 = await T.isTurnAllowed({ fromSegmentId: t.aId, nodeId: t.n1, toSegmentId: s.id });
+          const r2 = await T.isTurnAllowed({ fromSegmentId: s.id, nodeId: t.n2, toSegmentId: t.kId });
+          known = true;
+          if (r1 && r2) { allowed = true; break; }
+        } catch (e) { warnOnce('median-turns-call', e); allowed = true; break; }   // could not ask: keep the flag
+      }
+      if (known && !allowed) out.set(s.id, out.get(s.id).filter(x => x !== 'MEDIAN_UTURN'));
+    });
   }
   async function permissionPass(cands, out) {
-    for (let i = 0; i < cands.length; i += 50) {
-      await Promise.all(cands.slice(i, i + 50).map(async s => {
-        try {
-          const ok = await sdk.DataModel.Segments.hasPermissions({ segmentId: s.id });
-          if (!ok) out.get(s.id).push('LOCKED_ABOVE_RANK');
-        } catch (e) { /* ignore */ }
-      }));
-    }
+    await pool(cands, 10, async s => {
+      try {
+        const ok = await sdk.DataModel.Segments.hasPermissions({ segmentId: s.id });
+        if (!ok) out.get(s.id).push('LOCKED_ABOVE_RANK');
+      } catch (e) { /* ignore */ }
+    });
   }
   async function uturnPass(cands, ctx, out) {       // needs Turns.getTurnsFromSegment (checked in diagnostics)
     const T = sdk.DataModel.Turns;
     if (!T || typeof T.getTurnsFromSegment !== 'function') return warnOnce('uturn', 'Turns.getTurnsFromSegment missing');
     const loose = cands.filter(s => s.isDrivable && neighboursLoaded(s, ctx) && (at(ctx, s.fromNodeId).length === 1 || at(ctx, s.toNodeId).length === 1));
-    for (let i = 0; i < loose.length; i += 50) {
-      await Promise.all(loose.slice(i, i + 50).map(async s => {
-        try {
-          const turns = await T.getTurnsFromSegment({ segmentId: s.id });
-          const deadFwd = at(ctx, s.toNodeId).length === 1, deadRev = at(ctx, s.fromNodeId).length === 1;
-          if (turns.some(t => t.isUTurn && t.isAllowed && t.toSegmentId === s.id && ((t.fromSegmentFwd && deadFwd) || (!t.fromSegmentFwd && deadRev)))) out.get(s.id).push('UTURN_DEAD_END');
-        } catch (e) { warnOnce('uturn-call', e); }
-      }));
-    }
+    await pool(loose, 8, async s => {
+      try {
+        const turns = await T.getTurnsFromSegment({ segmentId: s.id });
+        const deadFwd = at(ctx, s.toNodeId).length === 1, deadRev = at(ctx, s.fromNodeId).length === 1;
+        if (turns.some(t => t.isUTurn && t.isAllowed && t.toSegmentId === s.id && ((t.fromSegmentFwd && deadFwd) || (!t.fromSegmentFwd && deadRev)))) out.get(s.id).push('UTURN_DEAD_END');
+      } catch (e) { warnOnce('uturn-call', e); }
+    });
   }
   function commit(cands, out) {
     for (const s of cands) {
@@ -1086,19 +1119,21 @@
       if (mine !== token) return;
       state.center = center;
       if (!all.length) { log.info('scan: no segments loaded'); return setStatus('No segments loaded at this zoom. Zoom in or pan.'); }
-      const ctx = await buildContext(all);
-      if (mine !== token) return;
       const sel = await selectCandidates(all, extent);
       if (mine !== token) return;
       ui.scopeNote.textContent = sel.note || '';
       if (sel.empty) return setStatus('That area is not available. Pick another, or import a polygon.');
       if (!state.accumulate) state.store.clear();
       if (!RULES.some(r => state.rules[r.id])) { state.store.clear(); await refreshView(); return setStatus('No rules ticked.'); }
+      const ctx = await buildContext(all, sel.cands);
+      if (mine !== token) return;
       const out = await evaluate(sel.cands, ctx);
       if (mine !== token) return;
       commit(sel.cands, out);
       await refreshView();
-      setStatus(`Scanned ${sel.cands.length} \u00B7 ${state.view.length} issues`);
+      const sk = state.skip || {};
+      const skipTxt = (sk.nb || sk.nm) ? ` \u00B7 skipped ${sk.nb ? `${sk.nb} neighbours-not-loaded` : ''}${sk.nb && sk.nm ? ', ' : ''}${sk.nm ? `${sk.nm} names-not-loaded` : ''}` : '';
+      setStatus(`Scanned ${sel.cands.length}${skipTxt} \u00B7 ${state.view.length} issues`);
       log.info(`scan scope=${state.scope} limitViewport=${state.limitToViewport} loaded=${all.length} scanned=${sel.cands.length} shown=${state.view.length} rules=${RULES.filter(r => state.rules[r.id]).length}/${RULES.length} ${Math.round(performance.now() - t0)}ms skipped(neighbours=${state.skip ? state.skip.nb : 0},names=${state.skip ? state.skip.nm : 0}) top=${topRules()}`);
     } finally {
       if (mine === token) ui.scanBtn.disabled = false;
