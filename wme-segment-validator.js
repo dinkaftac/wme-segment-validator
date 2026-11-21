@@ -6,7 +6,7 @@
 // @supportURL   https://github.com/dinkaftac/wme-segment-validator/issues
 // @updateURL    https://raw.githubusercontent.com/dinkaftac/wme-segment-validator/main/wme-segment-validator.user.js
 // @downloadURL  https://raw.githubusercontent.com/dinkaftac/wme-segment-validator/main/wme-segment-validator.user.js
-// @version      0.15.0
+// @version      0.17.0
 // @description  Segment validator: viewport / managed area / driven area / custom polygon (draw or shapefile), save-triggered re-checks, soft highlights under the roads, clickable error list. Official WME SDK only.
 // @match        https://www.waze.com/*/editor*
 // @match        https://beta.waze.com/*/editor*
@@ -23,10 +23,11 @@
 
   const ID = 'wme-segment-validator';
   const NAME = 'Segment Validator';
-  const VERSION = '0.15.0';
+  const VERSION = '0.17.0';
   const LAYER = 'segment-validator-highlights';
   const HALO_LAYER = 'segment-validator-current';   // halo behind the highlight for the focused segment
   const SCOPE_LAYER = 'segment-validator-scope';
+  const BORDER_LAYER = 'segment-validator-borders';   // all imported / drawn sections, always visible, labelled
   const MAX_DRAWN = 3000;
   const PAGE = 200;
 
@@ -60,6 +61,8 @@
     sweeping: false, sweepCancel: false, sweepPaused: false,
     sweepZoom: 14, bgEnabled: false, open: {}, areasReady: false,
     limitToViewport: true,
+    showSections: true,       // draw the borders + names of every imported / drawn section
+    skipDone: false,          // sweep only sections not yet swept this session
     managedAreaId: 'all',
     managedAreas: [],         // [{ id, name, geometry }]
     driveAreas: null,         // null = not loaded yet, otherwise [{ geometry, name, bbox }]
@@ -535,8 +538,9 @@
   // ------------------------------------------------ remembered settings (per browser, localStorage)
   const SETTINGS_KEY = 'wme-segment-validator:settings:v1';
   const POLY_KEY = 'wme-segment-validator:polygons:v1';
+  const RESULTS_KEY = 'wme-segment-validator:results:v1';   // swept sections + issues found, kept across reloads
   const PERSIST = ['enabled', 'autoMove', 'highlightOnly', 'autoSave', 'accumulate', 'loadMP', 'limitToViewport', 'abbrevPattern',
-    'extraWidth', 'nearMissM', 'layerOpacity', 'filterSev', 'filterRule', 'sortBy', 'hideVisited', 'zoomTo', 'selectOnJump', 'sweepZoom', 'bgEnabled'];
+    'extraWidth', 'nearMissM', 'layerOpacity', 'filterSev', 'filterRule', 'sortBy', 'hideVisited', 'zoomTo', 'selectOnJump', 'sweepZoom', 'bgEnabled', 'showSections', 'skipDone'];
   let savedAreaKey = 'viewport';
   const kv = {
     get(k) { try { const t = localStorage.getItem(k); return t ? JSON.parse(t) : null; } catch (e) { return null; } },
@@ -562,7 +566,14 @@
     state.nearMissM = Math.min(30, Math.max(1, Number(state.nearMissM) || 5));
     state.extraWidth = Math.min(20, Math.max(0, Number(state.extraWidth) || 0));
     const polys = kv.get(POLY_KEY);
+    const savedRes = kv.get(RESULTS_KEY);
     if (Array.isArray(polys)) polys.forEach(pl => { try { if (pl && pl.geometry && pl.geometry.coordinates) state.polygons.push(mkArea(pl.geometry, String(pl.name || 'Polygon'))); } catch (e) { /* skip bad entry */ } });
+    if (savedRes && typeof savedRes === 'object') {                  // swept marks and issue list from the last session
+      const done = new Set(Array.isArray(savedRes.done) ? savedRes.done : []);
+      state.polygons.forEach(a => { a.done = done.has(a.name); });
+      if (Array.isArray(savedRes.store)) savedRes.store.forEach(e => { if (e && e.id != null && e.geometry && Array.isArray(e.hits) && e.mid) state.store.set(e.id, e); });
+      state.restored = { done: done.size, issues: state.store.size, partial: !!savedRes.marksOnly };
+    }
   }
   function persistNow() {
     const key = String(state.areaKey);
@@ -577,6 +588,18 @@
     const data = state.polygons.map(a => ({ name: a.name, geometry: a.geometry }));
     if (JSON.stringify(data).length > 3e6) return log.warn('imported polygons are too big to remember; import them again next time');
     if (data.length) kv.set(POLY_KEY, data); else kv.del(POLY_KEY);
+  }
+  function saveResults() {                          // swept sections (imported ones) + the issues found so far
+    const done = state.polygons.filter(a => a.done).map(a => a.name);
+    let data = { v: 1, done, store: [...state.store.values()].map(e => ({ id: e.id, geometry: e.geometry, mid: e.mid, rt: e.rt, hits: e.hits })) };
+    let txt = JSON.stringify(data);
+    if (txt.length > 3.5e6) {                       // would not fit in browser storage: keep the marks, drop the issues, and say so
+      data = { v: 1, done, store: [], marksOnly: true };
+      txt = JSON.stringify(data);
+      setStatus('Too many issues to remember after a reload: the swept marks are saved, the issue list is not. Export CSV now.');
+      log.warn('results too big for browser storage: saved swept marks only');
+    }
+    if (!kv.set(RESULTS_KEY, data)) setStatus('Browser storage is full: results are not remembered. Export CSV now.');
   }
   const rememberOpen = (d, key, dflt) => {
     d.open = key in state.open ? !!state.open[key] : dflt;
@@ -757,8 +780,7 @@
     await drawScopeOutline();
     await refreshView();
     if (pan && state.scope === 'area') {
-      const a = areasForKey()[0];
-      if (a) { try { await sdk.Map.setMapCenter({ lonLat: areaCenter(a), zoomLevel: 13 }); } catch (e) { log.warn('pan to area', e); } }
+      await fitAreas(areasForKey(), false);
     }
     run();
   }
@@ -802,6 +824,9 @@
     if (state.sweeping) { state.sweepCancel = true; state.sweepPaused = false; return setStatus('Stopping sweep...'); }
     const areas = areasForKey();
     if (state.scope !== 'area' || !areas.length) return setStatus('Pick a managed, drive or imported area first.');
+    let groups = areas.length > 1 ? areas.map(a => [a]) : [areas];      // several areas: one section after another, each marked done when finished
+    if (state.skipDone) groups = groups.filter(g => !g.every(a => a.done));
+    if (!groups.length) return setStatus('Every section here is already swept. Untick "Skip swept sections" to sweep again.');
     const z = Math.min(17, Math.max(12, Number(ui.zoomSweep.value) || 14));
     state.sweeping = true; state.sweepCancel = false;
     sweepPrev = { lim: state.limitToViewport, acc: state.accumulate };
@@ -811,13 +836,14 @@
     let home = null;                                  // where the map was before the sweep, restored when it ends
     try { home = { c: await sdk.Map.getMapCenter(), z: await sdk.Map.getZoomLevel() }; } catch (e) { /* no restore */ }
     try {
-      await sdk.Map.setMapCenter({ lonLat: areaCenter(areas[0]), zoomLevel: z });
+      await sdk.Map.setMapCenter({ lonLat: areaCenter(groups[0][0]), zoomLevel: z });
       await settle();
       const ext = await sdk.Map.getMapExtent();
-      const tiles = tilesFor(areas, ext[2] - ext[0], ext[3] - ext[1]);
+      const tiles = groups.flatMap((g, gi) => tilesFor(g, ext[2] - ext[0], ext[3] - ext[1]).map(t => Object.assign(t, { g: gi })));
       log.info(`sweep: zoom ${z}, ${tiles.length} tiles`);
       if (tiles.length > 300 && !window.confirm(`This area needs ${tiles.length} screens at zoom ${z} (about ${Math.round(tiles.length * 4 / 60)} min). Continue?`)) return;
-      state.store.clear();
+      if (!state.skipDone) state.store.clear();
+      groups.forEach(g => g.forEach(a => { a.done = false; }));
       const tStart = Date.now();
       let pausedMs = 0;
       const mmss = ms => `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, '0')}`;
@@ -832,20 +858,24 @@
         const t = tiles[i];
         const el = Date.now() - tStart - pausedMs, eta = i ? el / i * (tiles.length - i) : 0;
         if (ui.sweepBar) ui.sweepBar.firstChild.style.width = `${Math.round(i / tiles.length * 100)}%`;
-        setStatus(`Sweep ${i + 1}/${tiles.length} · elapsed ${mmss(el)}${i ? ` · about ${mmss(eta)} left` : ''} · ${state.store.size} segments with issues`);
+        const secName = groups[t.g].length === 1 ? ` \u00B7 ${groups[t.g][0].name}` : '';
+        setStatus(`Sweep ${i + 1}/${tiles.length}${secName} · elapsed ${mmss(el)}${i ? ` · about ${mmss(eta)} left` : ''} · ${state.store.size} segments with issues`);
         await sdk.Map.setMapCenter({ lonLat: { lon: (t[0] + t[2]) / 2, lat: (t[1] + t[3]) / 2 }, zoomLevel: z });
         await settle();
         const segs = await sdk.DataModel.Segments.getAll();
-        if (segs.length === 0) {
-          log.warn(`Sweep: tile ${i + 1} returned 0 segments. Skipping.`);
-          continue;
+        if (segs.length === 0) log.warn(`Sweep: tile ${i + 1} returned 0 segments. Skipping.`);
+        else await scan({ force: true });
+        if ((i === tiles.length - 1 || tiles[i + 1].g !== t.g) && !state.sweepCancel) {   // last screen of this section
+          groups[t.g].forEach(a => { a.done = true; });
+          await drawScopeOutline();
+          saveResults();
         }
-        await scan({ force: true });
       }
       const stopped = state.sweepCancel;
       log.info(`sweep ${stopped ? 'stopped' : 'finished'}: ${tiles.length} tiles, stored=${state.store.size}`);
       if (ui.sweepBar && !stopped) ui.sweepBar.firstChild.style.width = '100%';
       await refreshView();
+      saveResults();
       setStatus(`Sweep ${stopped ? 'stopped' : 'done'} in ${mmss(Date.now() - tStart - pausedMs)} · ${state.view.length} issues`);
     } finally {
       endSweep();
@@ -870,14 +900,54 @@
     const cands = state.limitToViewport ? all.filter(inView) : all;
     return { cands: cands.filter(s => areas.some(a => segInArea(s, a))) };
   }
-  async function drawScopeOutline() {
+  async function drawScopeOutline() {              // the selected area(s): thick, on top
     await sdk.Map.removeAllFeaturesFromLayer({ layerName: SCOPE_LAYER });
     const areas = (await scopeAreas()).slice(0, 200);
-    if (!areas.length) return;
-    await sdk.Map.addFeaturesToLayer({
+    if (areas.length) await sdk.Map.addFeaturesToLayer({
       layerName: SCOPE_LAYER,
-      features: areas.map((a, i) => ({ type: 'Feature', id: `scope-${i}`, geometry: a.geometry, properties: {} })),
+      features: areas.map((a, i) => ({ type: 'Feature', id: `scope-${i}`, geometry: a.geometry, properties: { color: a.done ? '#2e7d32' : '#3949ab' } })),
     });
+    await drawBoundaries();
+    await updateHere();
+  }
+  async function drawBoundaries() {                // every imported / drawn section, with its name, whether selected or not
+    try {
+      await sdk.Map.removeAllFeaturesFromLayer({ layerName: BORDER_LAYER });
+      if (!state.showSections || !state.polygons.length) return;
+      await sdk.Map.addFeaturesToLayer({
+        layerName: BORDER_LAYER,
+        features: state.polygons.slice(0, 500).map((a, i) => ({ type: 'Feature', id: `sec-${i}`, geometry: a.geometry,
+          properties: { label: (a.done ? '\u2713 ' : '') + a.name, color: a.done ? '#2e7d32' : '#e65100' } })),
+      });
+    } catch (e) { warnOnce('borders', e); }
+  }
+  async function updateHere() {                    // "you are in section X" for the map centre (like Mapraid's top bar)
+    if (!ui.here) return;
+    if (!state.polygons.length) { ui.here.textContent = ''; return; }
+    try {
+      const c = await sdk.Map.getMapCenter(), p = [c.lon, c.lat];
+      const hit = state.polygons.filter(a => p[0] >= a.bbox[0] && p[0] <= a.bbox[2] && p[1] >= a.bbox[1] && p[1] <= a.bbox[3] && polygonContains(p, a.geometry));
+      ui.here.textContent = hit.length ? `Map centre is in: ${hit.map(a => a.name + (a.done ? ' \u2713 swept' : '')).join(', ')}` : 'Map centre is outside the imported sections';
+    } catch (e) { /* ignore */ }
+  }
+  const bboxOfAreas = areas => areas.reduce((b, a) => [Math.min(b[0], a.bbox[0]), Math.min(b[1], a.bbox[1]), Math.max(b[2], a.bbox[2]), Math.max(b[3], a.bbox[3])], [180, 90, -180, -90]);
+  async function fitAreas(areas, corner) {         // zoom out so the whole border is on screen (or go to the NW corner so two borders cross the screen)
+    if (!areas.length) return setStatus('Pick an area first.');
+    const bb = bboxOfAreas(areas);
+    try {
+      const z0 = await sdk.Map.getZoomLevel();
+      if (corner) {
+        await sdk.Map.setMapCenter({ lonLat: { lon: bb[0], lat: bb[3] }, zoomLevel: clampZoom(Math.min(z0, 15)) });
+        return setStatus('At the top-left corner of the area: its borders cross the screen here.');
+      }
+      await sdk.Map.setMapCenter({ lonLat: { lon: (bb[0] + bb[2]) / 2, lat: (bb[1] + bb[3]) / 2 }, zoomLevel: z0 });
+      await sleep(400);
+      const ext = await sdk.Map.getMapExtent();
+      const ratio = Math.max((bb[2] - bb[0]) / (ext[2] - ext[0]), (bb[3] - bb[1]) / (ext[3] - ext[1])) * 1.1;
+      const nz = clampZoom(z0 - Math.ceil(Math.log2(ratio)));
+      await sdk.Map.setMapCenter({ lonLat: { lon: (bb[0] + bb[2]) / 2, lat: (bb[1] + bb[3]) / 2 }, zoomLevel: nz });
+      setStatus(`Zoom ${nz}: ${nz <= 12 ? 'this is WME\'s widest view, so a large area may still run past the screen edges. Use "Go to corner".' : 'the whole area border should be on screen.'}`);
+    } catch (e) { log.warn('fit area', e); }
   }
   function extractPolygons(g, out = []) {
     if (!g) return out;
@@ -887,6 +957,20 @@
     if (g.type === 'GeometryCollection') return extractPolygons(g.geometries, out);
     if (g.type === 'Polygon') out.push({ type: 'Polygon', coordinates: g.coordinates });
     if (g.type === 'MultiPolygon') g.coordinates.forEach(c => out.push({ type: 'Polygon', coordinates: c }));
+    return out;
+  }
+  function extractNamed(g, out = []) {          // like extractPolygons, but keeps each feature's name / id property
+    if (!g) return out;
+    if (Array.isArray(g)) { g.forEach(x => extractNamed(x, out)); return out; }
+    if (g.type === 'FeatureCollection') return extractNamed(g.features, out);
+    if (g.type === 'Feature') {
+      const p = g.properties || {};
+      const nm = ['name', 'Name', 'NAME', 'id', 'ID', 'Id', 'label', 'title'].map(k => p[k]).find(v => v != null && String(v).trim() !== '');
+      const parts = extractPolygons(g.geometry);
+      parts.forEach((geo, i) => out.push({ geometry: geo, name: nm != null ? String(nm) + (parts.length > 1 ? ` #${i + 1}` : '') : '' }));
+      return out;
+    }
+    extractPolygons(g).forEach(geo => out.push({ geometry: geo, name: '' }));
     return out;
   }
   function parseWkt(txt) {                 // POLYGON / MULTIPOLYGON anywhere in the text (plain .wkt, or a CSV column)
@@ -917,7 +1001,7 @@
   }
   async function importFile(file) {
     let polys;
-    if (/\.(wkt|txt|csv)$/i.test(file.name)) polys = parseWkt(await file.text());
+    if (/\.(wkt|txt|csv)$/i.test(file.name)) polys = parseWkt(await file.text()).map(geometry => ({ geometry, name: '' }));
     else {
       const buf = await file.arrayBuffer();
       let gj;
@@ -926,13 +1010,14 @@
         if (!shp) throw new Error('shpjs is not loaded (check the @require line / network)');
         gj = await shp(buf);
       } else gj = JSON.parse(new TextDecoder().decode(buf));
-      polys = extractPolygons(gj);
+      polys = extractNamed(gj);
     }
     if (!polys.length) throw new Error('no Polygon / MultiPolygon geometry found');
-    const [x, y] = polys[0].coordinates[0][0];
+    const [x, y] = polys[0].geometry.coordinates[0][0];
     if (Math.abs(x) > 180 || Math.abs(y) > 90) throw new Error('coordinates are not WGS84 lon/lat (shapefile without a .prj?)');
     const base = file.name.replace(/\.[^.]+$/, '');
-    polys.forEach((g, i) => state.polygons.push(mkArea(g, polys.length > 1 ? `${base} #${i + 1}` : base)));
+    if (polys.every(it => it.name)) polys.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+    polys.forEach((it, i) => state.polygons.push(mkArea(it.geometry, it.name || (polys.length > 1 ? `${base} #${i + 1}` : base))));
     log.info(`imported ${polys.length} polygon(s) from ${file.name}`);
   }
 
@@ -1154,6 +1239,7 @@
     state.store.clear(); state.visited.clear(); state.currentId = null;
     await sdk.Map.removeAllFeaturesFromLayer({ layerName: HALO_LAYER });
     await refreshView();
+    saveResults();
     setStatus('Highlights cleared');
   }
 
@@ -1477,6 +1563,7 @@
     ui.area = h('select', { style: 'max-width:100%' });
     ui.area.onchange = () => chooseArea(ui.area.value, true).catch(e => log.warn('area select', e));
     ui.scopeNote = h('div', { style: 'font-size:11px;color:#b26a00' });
+    ui.here = h('div', { style: 'font-size:12px;font-weight:bold;margin-top:4px' });
     const drawBtn = mkBtn('Draw', async () => {
       setStatus('Draw the polygon on the map...');
       try {
@@ -1564,7 +1651,7 @@
       mkCopyBtn('Copy log', () => logBuf.join('\n')), ' ',
       mkCopyBtn('Copy diagnostics', diagnostics), ' ',
       mkBtn('Clear', () => { logBuf.length = 0; ui.log.value = ''; }), ' ',
-      mkBtn('Reset saved settings', () => { kv.del(SETTINGS_KEY); kv.del(POLY_KEY); clearTimeout(persistTimer); persistTimer = 0; state.areasReady = false; setStatus('Saved settings cleared. Reload the page to start from defaults.'); }));
+      mkBtn('Reset saved settings', () => { kv.del(SETTINGS_KEY); kv.del(POLY_KEY); kv.del(RESULTS_KEY); clearTimeout(persistTimer); persistTimer = 0; state.areasReady = false; setStatus('Saved settings cleared. Reload the page to start from defaults.'); }));
 
     ui.bgBtn = mkBtn('Scan map problems', () => bgScan().catch(e => { log.error('bgScan', e); bg.running = false; }), { disabled: !state.bgEnabled });
     ui.bgBar = h('div', { style: 'height:6px;background:#e0e0e0;border-radius:3px;margin:4px 0;overflow:hidden' }, h('div', { style: 'height:6px;width:0;background:#d81b60' }));
@@ -1580,10 +1667,15 @@
       h('b', { textContent: NAME }),
       mkCheck('Enabled', state.enabled, async v => {
         state.enabled = v;
-        for (const layerName of [LAYER, HALO_LAYER, SCOPE_LAYER, MP_LAYER]) await sdk.Map.setLayerVisibility({ layerName, visibility: v });
+        for (const layerName of [LAYER, HALO_LAYER, SCOPE_LAYER, BORDER_LAYER, MP_LAYER]) await sdk.Map.setLayerVisibility({ layerName, visibility: v });
         if (v) run();
       }),
       h('div', { style: 'margin-top:4px' }, 'Area: ', ui.area), h('div', { style: 'margin-top:4px' }, drawBtn, ' ', importBtn, ' ', clearPolyBtn, ' ', ui.sweepBtn, ' ', ui.pauseBtn, ' ', ui.nudgeBtn, ' zoom ', ui.zoomSweep), ui.sweepBar, ui.file, ui.scopeNote,
+      h('div', { style: 'margin-top:4px' }, mkBtn('Fit area', () => fitAreas(areasForKey(), false)), ' ', mkBtn('Go to corner', () => fitAreas(areasForKey(), true)), ' ',
+        mkBtn('Mark all unswept', async () => { [...state.polygons, ...state.managedAreas, ...(state.driveAreas || [])].forEach(a => { a.done = false; }); await drawScopeOutline(); saveResults(); })),
+      ui.here,
+      mkCheck('Show section borders and names on the map', state.showSections, async v => { state.showSections = v; await drawBoundaries(); }),
+      mkCheck('Skip sections already swept (this session)', state.skipDone, v => { state.skipDone = v; }),
       mkCheck('Limit to screen viewport (area scopes)', state.limitToViewport, v => { state.limitToViewport = v; run(); }),
       mkCheck('Include Waze map problems (shows WME\'s Map Problems layer so they load)', state.loadMP, async v => {
         state.loadMP = v;
@@ -1642,6 +1734,7 @@
       try {
         const z = await sdk.Map.getLayerZIndex({ layerName });
         for (const own of [LAYER, HALO_LAYER]) await sdk.Map.setLayerZIndex({ layerName: own, zIndex: z - 1 });
+        for (const own of [BORDER_LAYER, SCOPE_LAYER]) { try { await sdk.Map.setLayerZIndex({ layerName: own, zIndex: z + 2 }); } catch (e2) { warnOnce('border-z', e2); } }   // borders above the roads so they are never hidden
         state.underRoads = `yes (below "${layerName}", z=${z - 1})`;
         return log.info(`highlight layers placed below "${layerName}" (z=${z})`);
       } catch (e) { /* try next candidate */ }
@@ -1652,11 +1745,26 @@
   const widthFor = (zoom, rt) => Math.max(5, (zoom - 8) * 1.1) * (WIDTH_FACTOR[rt] || 1) + state.extraWidth;
   async function cleanup() {
     offs.splice(0).forEach(off => { try { off(); } catch (e) { /* ignore */ } });
-    for (const layerName of [LAYER, HALO_LAYER, SCOPE_LAYER, MP_LAYER]) { try { await sdk.Map.removeLayer({ layerName }); } catch (e) { /* ignore */ } }
+    for (const layerName of [LAYER, HALO_LAYER, SCOPE_LAYER, BORDER_LAYER, MP_LAYER]) { try { await sdk.Map.removeLayer({ layerName }); } catch (e) { /* ignore */ } }
   }
 
   async function init() {
-    await sdk.Map.addLayer({ layerName: SCOPE_LAYER, styleRules: [{ style: { strokeColor: '#3949ab', strokeWidth: 3, fillOpacity: 0 } }] });
+    await sdk.Map.addLayer({
+      layerName: BORDER_LAYER,
+      styleContext: {
+        getColor: ({ feature }) => (feature && feature.properties && feature.properties.color) || '#e65100',
+        getLabel: ({ feature }) => (feature && feature.properties && feature.properties.label) || '',
+      },
+      styleRules: [{ style: { strokeColor: '${getColor}', strokeOpacity: 0.9, strokeWidth: 2, strokeDashstyle: 'dash', fillOpacity: 0,
+        label: '${getLabel}', labelAlign: 'cm', fontSize: '18px', fontWeight: 'bold', fontColor: '${getColor}', labelOutlineColor: '#ffffff', labelOutlineWidth: 4 } }],
+    });
+    await sdk.Map.addLayer({
+      layerName: SCOPE_LAYER,
+      styleContext: {
+        getColor: ({ feature }) => (feature && feature.properties && feature.properties.color) || '#3949ab',
+      },
+      styleRules: [{ style: { strokeColor: '${getColor}', strokeWidth: 3, fillOpacity: 0 } }],
+    });
     await sdk.Map.addLayer({
       layerName: MP_LAYER,
       styleContext: { getTip: ({ feature }) => (feature && feature.properties && feature.properties.tip) || '' },
@@ -1682,7 +1790,7 @@
     await placeBelowRoads();
     try {
       await sdk.Map.setLayerOpacity({ layerName: LAYER, opacity: state.layerOpacity });
-      if (!state.enabled) for (const layerName of [LAYER, HALO_LAYER, SCOPE_LAYER, MP_LAYER]) await sdk.Map.setLayerVisibility({ layerName, visibility: false });
+      if (!state.enabled) for (const layerName of [LAYER, HALO_LAYER, SCOPE_LAYER, BORDER_LAYER, MP_LAYER]) await sdk.Map.setLayerVisibility({ layerName, visibility: false });
     } catch (e) { warnOnce('restore-layers', e); }
     applyCapture();
     try {
@@ -1702,13 +1810,17 @@
     ['wme-map-data-loaded', 'wme-map-zoom-changed', 'wme-map-move-end'].forEach(n => on(n, run));
     on('wme-after-edit', collectEdited);
     on('wme-save-finished', p => onSaveFinished(p).catch(e => log.error('save handler failed', e)));
+    on('wme-map-move-end', updateHere);
+    on('wme-map-zoom-changed', updateHere);
     on('wme-map-move-end', async () => {
       if (state.sortBy !== 'distance') return;
       try { state.center = await sdk.Map.getMapCenter(); await refreshView(); } catch (e) { log.warn('distance refresh', e); }
     });
     window.addEventListener('beforeunload', () => { cleanup(); });
 
+    if (state.restored) log.info(`restored from last session: ${state.restored.done} swept section(s), ${state.restored.issues} issue(s)${state.restored.partial ? ' (marks only: issue list was too big to save)' : ''}`);
     buildAreaSelect();
+    drawBoundaries().then(updateHere);
     ensureMpLayer();
     loadAreas().catch(e => log.warn('loadAreas', e)).finally(() => { state.areasReady = true; persistSoon(); });
     run();
