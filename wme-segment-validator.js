@@ -6,7 +6,7 @@
 // @supportURL   https://github.com/dinkaftac/wme-segment-validator/issues
 // @updateURL    https://raw.githubusercontent.com/dinkaftac/wme-segment-validator/main/wme-segment-validator.user.js
 // @downloadURL  https://raw.githubusercontent.com/dinkaftac/wme-segment-validator/main/wme-segment-validator.user.js
-// @version      0.25.0
+// @version      0.25.3
 // @description  Segment validator: viewport / managed area / driven area / custom polygon (draw or shapefile), save-triggered re-checks, soft highlights under the roads, clickable error list. Official WME SDK only.
 // @match        https://www.waze.com/*/editor*
 // @match        https://beta.waze.com/*/editor*
@@ -23,7 +23,7 @@
 
   const ID = 'wme-segment-validator';
   const NAME = 'Segment Validator';
-  const VERSION = '0.25.0';
+  const VERSION = '0.25.3';
   const LAYER = 'segment-validator-highlights';
   const HALO_LAYER = 'segment-validator-current';   // halo behind the highlight for the focused segment
   const SCOPE_LAYER = 'segment-validator-scope';
@@ -47,6 +47,7 @@
 
   let sdk;
   const ui = {};
+  const PLACE_MP = 'place problem (sits on a place)';   // 'Missing place details' and similar: the SDK says only DATA, so a problem sitting on a place is taken as one
   const offs = [];                                    // unregister functions returned by Events.on (if any)
   const state = {
     enabled: true,
@@ -56,7 +57,7 @@
     autoSave: true,           // validate edited segments after a successful save
     accumulate: true,
     scope: 'viewport',        // 'viewport' | 'area'
-    loadMP: true, mpSig: '',
+    loadMP: true, mpSig: '', mpHidden: [PLACE_MP], mpSeen: {},
     areaKey: 'viewport',      // 'viewport' | 'managed:<i|all>' | 'drive:<i|all>' | 'custom:<i|all>'
     sweeping: false, sweepCancel: false, sweepPaused: false,
     sweepZoom: 14, bgEnabled: false, open: {}, areasReady: false,
@@ -474,6 +475,18 @@
     }
     return map;
   }
+  // ---- map problem types you can switch off (e.g. place-related ones that a rank 1 editor cannot act on)
+  function mpKey(x) { return String(x == null ? 'unknown' : x).replace(/([a-z])([A-Z])/g, '$1 $2').replace(/[_-]+/g, ' ').trim().toLowerCase() || 'unknown'; }
+  let mpShapeLogged = false;
+  function mpKeyOf(m) {                              // the SDK only says problemType "DATA" for everything seen so far, so use any sub type it offers
+    if (!mpShapeLogged) { mpShapeLogged = true; log.info(`map problem sample keys: ${Object.keys(m).join(',')} :: ${fmt(m).slice(0, 500)}`); }
+    const st = m.subType ?? m.problemSubType ?? m.subtype ?? m.problemSubtype ?? m.reason ?? m.category;
+    if (st == null) return mpKey(m.problemType);
+    const named = typeof MP_TYPES !== 'undefined' && MP_TYPES[st];
+    return named ? mpKey(named) : mpKey(`${m.problemType ?? ''} ${st}`);
+  }
+  const mpHide = k => state.mpHidden.includes(k);
+  function mpSeenNote(k) { if (!(k in state.mpSeen)) { state.mpSeen[k] = 1; if (ui.mpTypes) renderMpTypes(); } }
   async function buildContext(all, cands = all) {      // cands: the segments that will be checked; names are looked up for those only
     const c = { seg: new Map(), nodes: new Map(), pairs: new Map(), streets: new Map(), cities: new Map(), states: new Map(), _grid: null };
     const streetIds = new Set();
@@ -510,14 +523,22 @@
       try {
         const mps = (await sdk.DataModel.MapProblems.getAll()).filter(m => m && m.isOpen !== false && m.geometry && m.geometry.coordinates);
         const types = {};
+        let venuePts = [];
+        try { venuePts = (await sdk.DataModel.Venues.getAll()).map(placeMid).filter(Boolean); } catch (e) { warnOnce('mp-venues', e); }
+        let placeMps = 0;
         for (const m of mps) {
           types[String(m.problemType)] = (types[String(m.problemType)] || 0) + 1;
+          const pp = m.geometry.coordinates;
+          const onPlace = venuePts.some(v => Math.abs(v[0] - pp[0]) < 0.0001 && Math.abs(v[1] - pp[1]) < 0.0001 && distM({ lon: pp[0], lat: pp[1] }, v) < 6);
+          if (onPlace) placeMps++;
+          const mk = onPlace ? PLACE_MP : mpKeyOf(m); mpSeenNote(mk);
+          if (mpHide(mk)) continue;                  // switched off in "Map problem types"
           const p = m.geometry.coordinates;
           const hits = [...near(c, p)].map(t => [distPointToLineM(p, t.geometry.coordinates), t]).filter(x => x[0] < 25).sort((a, b) => a[0] - b[0]).slice(0, 3);
           for (const [, t] of hits) { if (!c.mp.has(t.id)) c.mp.set(t.id, []); c.mp.get(t.id).push(m); }
         }
         const sig = JSON.stringify(types);
-        if (sig !== state.mpSig) { state.mpSig = sig; log.info(`map problems loaded: open=${mps.length} byType=${sig} segmentsFlagged=${c.mp.size}`); }
+        if (sig !== state.mpSig) { state.mpSig = sig; log.info(`map problems loaded: open=${mps.length} onPlaces=${placeMps} byType=${sig} segmentsFlagged=${c.mp.size}`); }
       } catch (e) { warnOnce('map-problems', e); }
     }
     return c;
@@ -767,7 +788,7 @@
   const RESULTS_KEY = 'wme-segment-validator:results:v1';
   const PTAGS_KEY = 'wme-segment-validator:place-tags:v1';   // places you marked checked / closed / moved   // swept sections + issues found, kept across reloads
   const PERSIST = ['enabled', 'autoMove', 'highlightOnly', 'autoSave', 'accumulate', 'loadMP', 'limitToViewport', 'abbrevPattern',
-    'extraWidth', 'nearMissM', 'layerOpacity', 'filterSev', 'filterRule', 'sortBy', 'hideVisited', 'zoomTo', 'selectOnJump', 'sweepZoom', 'bgEnabled', 'showSections', 'skipDone', 'placesOn', 'uiTab', 'pHideChecked', 'pSev', 'pRuleF', 'pMark', 'pSort', 'staleYears'];
+    'extraWidth', 'nearMissM', 'layerOpacity', 'filterSev', 'filterRule', 'sortBy', 'hideVisited', 'zoomTo', 'selectOnJump', 'sweepZoom', 'bgEnabled', 'showSections', 'skipDone', 'placesOn', 'uiTab', 'pHideChecked', 'pSev', 'pRuleF', 'pMark', 'pSort', 'staleYears', 'mpHidden'];
   let savedAreaKey = 'viewport';
   const kv = {
     get(k) { try { const t = localStorage.getItem(k); return t ? JSON.parse(t) : null; } catch (e) { return null; } },
@@ -778,6 +799,7 @@
     const sv = kv.get(SETTINGS_KEY);
     if (sv && typeof sv === 'object') {
       for (const k of PERSIST) if (k in sv && typeof sv[k] === typeof state[k]) state[k] = sv[k];
+      state.mpHidden = Array.isArray(state.mpHidden) ? state.mpHidden.filter(x => typeof x === 'string') : [];
       if (sv.rules && typeof sv.rules === 'object') for (const id of Object.keys(state.rules)) if (typeof sv.rules[id] === 'boolean') state.rules[id] = sv.rules[id];
       const cu = kv.get(PCUSTOM_KEY);
       if (Array.isArray(cu)) state.pCustom = cu.filter(c => c && typeof c.id === 'string' && c.id.startsWith('C_') && typeof c.label === 'string' && typeof c.pattern === 'string' && CFIELDS.some(f => f[0] === c.field) && COPS.some(o => o[0] === c.op));
@@ -1704,8 +1726,19 @@
     }
     throw new Error('WME feature service not found');
   }
+  function renderMpTypes() {
+    if (!ui.mpTypes) return;
+    const keys = [...new Set([...Object.keys(state.mpSeen), ...state.mpHidden])].sort();
+    ui.mpTypes.textContent = '';
+    if (!keys.length) ui.mpTypes.append(h('div', { textContent: 'Types appear here after the first scan that sees map problems.', style: 'font-size:12px;color:#777' }));
+    for (const k of keys) {
+      const cb = h('input', { type: 'checkbox', checked: !mpHide(k) });
+      cb.onchange = () => { state.mpHidden = cb.checked ? state.mpHidden.filter(x => x !== k) : [...new Set([...state.mpHidden, k])]; persistSoon(); renderMp(); run(); };
+      ui.mpTypes.append(h('label', { style: 'display:block;font-size:12px' }, cb, ' ' + k.charAt(0).toUpperCase() + k.slice(1)));
+    }
+  }
   async function renderMp() {
-    const pts = [...bg.points.values()];
+    const pts = [...bg.points.values()].filter(o => !mpHide(mpKey(mpName(o))));
     try {
       await sdk.Map.removeAllFeaturesFromLayer({ layerName: MP_LAYER });
       if (pts.length) await sdk.Map.addFeaturesToLayer({ layerName: MP_LAYER, features: pts.slice(0, 3000).map(o => ({
@@ -1768,7 +1801,7 @@
               for (const o of objs) {
                 const c = o && o.geometry && o.geometry.coordinates;
                 if (!c || o.open === false) continue;
-                if (areas.some(a => polygonContains(c, a.geometry))) bg.points.set(o.id, { id: o.id, lon: c[0], lat: c[1], subType: o.subType, type: o.type });
+                if (areas.some(a => polygonContains(c, a.geometry))) { bg.points.set(o.id, { id: o.id, lon: c[0], lat: c[1], subType: o.subType, type: o.type }); mpSeenNote(mpKey(mpName(o))); }
               }
             }
           } catch (e) {
@@ -2465,6 +2498,15 @@
         if (v) await ensureMpLayer();
         run();
       }),
+      (() => {
+        ui.mpTypes = h('div');
+        const box = rememberOpen(h('details', { style: 'margin:2px 0 4px 16px' }, h('summary', { textContent: 'Map problem types (tick = show)', style: 'cursor:pointer;font-size:12px' })), 'mp:types', false);
+        box.append(h('div', { style: 'margin:3px 0' },
+          mkBtn('Hide place-related', () => { const ks = Object.keys(state.mpSeen).filter(k => /place|venue|poi/.test(k)); state.mpHidden = [...new Set([...state.mpHidden, ...ks])]; persistSoon(); renderMpTypes(); renderMp(); run(); }), ' ',
+          mkBtn('Show all', () => { state.mpHidden = []; persistSoon(); renderMpTypes(); renderMp(); run(); })), ui.mpTypes);
+        renderMpTypes();
+        return box;
+      })(),
       h('div', { style: 'margin-top:6px;font-weight:bold;font-size:12px' }, 'Triggers'),
       mkCheck('Highlight only (no auto-pan)', state.highlightOnly, v => { state.highlightOnly = v; }),
       mkCheck('Auto-scan on map move / zoom', state.autoMove, v => { state.autoMove = v; if (v) run(); }),
