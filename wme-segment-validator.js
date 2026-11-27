@@ -6,7 +6,7 @@
 // @supportURL   https://github.com/dinkaftac/wme-segment-validator/issues
 // @updateURL    https://raw.githubusercontent.com/dinkaftac/wme-segment-validator/main/wme-segment-validator.user.js
 // @downloadURL  https://raw.githubusercontent.com/dinkaftac/wme-segment-validator/main/wme-segment-validator.user.js
-// @version      0.25.3
+// @version      0.28.1
 // @description  Segment validator: viewport / managed area / driven area / custom polygon (draw or shapefile), save-triggered re-checks, soft highlights under the roads, clickable error list. Official WME SDK only.
 // @match        https://www.waze.com/*/editor*
 // @match        https://beta.waze.com/*/editor*
@@ -23,7 +23,7 @@
 
   const ID = 'wme-segment-validator';
   const NAME = 'Segment Validator';
-  const VERSION = '0.25.3';
+  const VERSION = '0.28.1';
   const LAYER = 'segment-validator-highlights';
   const HALO_LAYER = 'segment-validator-current';   // halo behind the highlight for the focused segment
   const SCOPE_LAYER = 'segment-validator-scope';
@@ -82,6 +82,8 @@
     filterRule: 'all',
     sortBy: 'severity',
     hideVisited: false,
+    verbose: false,
+    editBox: true,
     listLimit: PAGE,
     zoomTo: 17,
     selectOnJump: false,
@@ -162,7 +164,8 @@
         'addFeaturesToLayer', 'removeAllFeaturesFromLayer', 'redrawLayer', 'setLayerOpacity', 'setLayerVisibility',
         'getLayerZIndex', 'setLayerZIndex', 'drawPolygon']],
       ['State', sdk.State, ['getUserInfo', 'isMapLoading']],
-      ['DataModel.Segments', dm.Segments, ['getAll', 'getById', 'hasPermissions']],
+      ['DataModel.Segments', dm.Segments, ['getAll', 'getById', 'hasPermissions', 'isFromNodeInBigJunction', 'isToNodeInBigJunction', 'isContainedInBigJunction']],
+      ['DataModel.Countries', dm.Countries, ['getTopCountry']],
       ['DataModel.Streets', dm.Streets, ['getAll', 'getById']],
       ['DataModel.Cities', dm.Cities, ['getAll', 'getById']],
       ['DataModel.ManagedAreas', dm.ManagedAreas, ['getById', 'getAll']],
@@ -414,6 +417,86 @@
     }
     return false;
   }
+  // ---- hidden geometry faults (metres, local planar approximation)
+  const mPerDeg = lat => [Math.cos(lat * Math.PI / 180) * 111320, 110540];
+  const dM = (p, q) => { const [kx, ky] = mPerDeg(p[1]); return Math.hypot((p[0] - q[0]) * kx, (p[1] - q[1]) * ky); };
+  const ptAt = (coords, f) => {                    // point at fraction f of the polyline length
+    let tot = 0; const L = [];
+    for (let i = 1; i < coords.length; i++) { const d = dM(coords[i - 1], coords[i]); L.push(d); tot += d; }
+    let want = tot * f;
+    for (let i = 0; i < L.length; i++) {
+      if (want <= L[i] || i === L.length - 1) { const t = L[i] ? Math.min(1, want / L[i]) : 0; return [coords[i][0] + (coords[i + 1][0] - coords[i][0]) * t, coords[i][1] + (coords[i + 1][1] - coords[i][1]) * t]; }
+      want -= L[i];
+    }
+    return coords[0];
+  };
+  const sameLvl = (a, b) => (a.elevationLevel ?? 0) === (b.elevationLevel ?? 0);
+  function zeroLen(s) { return s.isDrivable && s.fromNodeId != null && s.toNodeId != null && Number(s.length) < 1; }
+  function stuckVertex(s) {                        // a vertex sitting on top of the first / last node
+    const co = s.geometry.coordinates;
+    if (!s.isDrivable || co.length < 3) return false;
+    for (let i = 1; i < co.length - 1; i++) if (dM(co[i], co[0]) < 1 || dM(co[i], co[co.length - 1]) < 1) return true;
+    return false;
+  }
+  function sharpAngle(s) {                         // a vertex that folds the line back on itself (interior angle under 90 degrees)
+    const co = s.geometry.coordinates;
+    if (!s.isDrivable || co.length < 3) return false;
+    for (let i = 1; i < co.length - 1; i++) {
+      const [kx, ky] = mPerDeg(co[i][1]);
+      const ax = (co[i - 1][0] - co[i][0]) * kx, ay = (co[i - 1][1] - co[i][1]) * ky, bx = (co[i + 1][0] - co[i][0]) * kx, by = (co[i + 1][1] - co[i][1]) * ky;
+      const la = Math.hypot(ax, ay), lb = Math.hypot(bx, by);
+      if (la < 0.5 || lb < 0.5) continue;
+      if (Math.acos(Math.max(-1, Math.min(1, (ax * bx + ay * by) / (la * lb)))) * 180 / Math.PI < 90) return true;
+    }
+    return false;
+  }
+  function dupSeg(s, c) {                          // another road with the same two nodes and (nearly) the same line
+    if (!s.isDrivable || s.fromNodeId == null || s.toNodeId == null || s.fromNodeId === s.toNodeId) return false;
+    if ((c.pairs.get(pairKey(s)) || 0) < 2) return false;
+    return others(c, s, s.fromNodeId).some(t => t.isDrivable && pairKey(t) === pairKey(s) && sameLvl(s, t) &&
+      s.geometry.coordinates.every(p => distPointToLineM(p, t.geometry.coordinates) < 1.5));
+  }
+  function alongOther(s, c) {                      // lies along another road without sharing its start: the road underneath is hidden
+    if (!s.isDrivable || s.geometry.coordinates.length < 2 || !(s.length > 3)) return false;
+    const co = s.geometry.coordinates, pts = [0.2, 0.35, 0.5, 0.65, 0.8].map(f => ptAt(co, f));
+    const cand = new Set(); pts.forEach(p => near(c, p).forEach(t => cand.add(t)));
+    for (const t of cand) {
+      if (t.id === s.id || !t.isDrivable || !sameLvl(s, t) || t.geometry.coordinates.length < 2) continue;
+      if (pairKey(t) === pairKey(s) && dupSeg(s, c)) continue;           // reported as a duplicate already
+      if (pts.filter(p => distPointToLineM(p, t.geometry.coordinates) < 2.5).length >= 4) return true;
+    }
+    return false;
+  }
+  function coincidentEnds(s, c) {                  // end point on top of another road's end point, but not the same node
+    if (!s.isDrivable) return false;
+    const co = s.geometry.coordinates;
+    for (const [nid, p] of [[s.fromNodeId, co[0]], [s.toNodeId, co[co.length - 1]]]) {
+      if (nid == null) continue;
+      for (const t of near(c, p)) {
+        if (t.id === s.id || !t.isDrivable || !sameLvl(s, t)) continue;
+        const tc = t.geometry.coordinates;
+        for (const [tn, q] of [[t.fromNodeId, tc[0]], [t.toNodeId, tc[tc.length - 1]]]) if (tn !== nid && dM(p, q) < 0.5) return true;
+      }
+    }
+    return false;
+  }
+  const segX = (a, b, c2, d) => {                  // proper crossing of segments ab and cd
+    const o = (p, q, r) => (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0]);
+    const d1 = o(c2, d, a), d2 = o(c2, d, b), d3 = o(a, b, c2), d4 = o(a, b, d);
+    return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
+  };
+  function crossNoJunction(s, c) {                 // two roads at the same level cross and have no node in common
+    if (!s.isDrivable || s.geometry.coordinates.length < 2) return false;
+    const co = s.geometry.coordinates, cand = new Set();
+    near(c, co[0]).forEach(t => cand.add(t)); near(c, co[co.length - 1]).forEach(t => cand.add(t)); near(c, ptAt(co, 0.5)).forEach(t => cand.add(t));
+    for (const t of cand) {
+      if (t.id === s.id || !t.isDrivable || !sameLvl(s, t) || t.geometry.coordinates.length < 2) continue;
+      if (ends(s).some(n => n != null && ends(t).includes(n))) continue;
+      const tc = t.geometry.coordinates;
+      for (let i = 1; i < co.length; i++) for (let j = 1; j < tc.length; j++) if (segX(co[i - 1], co[i], tc[j - 1], tc[j])) return true;
+    }
+    return false;
+  }
   const norm180 = a => ((a % 360) + 540) % 360 - 180;
   // Waze median U-turn prevention: turn in (A), ONE short median segment (B), turn out (C), A and C about parallel (turns add up to ~180 degrees).
   // Waze then adds a huge penalty and the U-turn is effectively never routed. A median of 16 m or more always allows it.
@@ -555,7 +638,11 @@
     { id: 'MP_OPEN', cat: 'server', sev: 'error', on: true, label: 'Open Waze map problem at this segment',
       test: (s, c) => (c.mp.get(s.id) || []).length > 0 },
     // --- Missing info & naming
-    { id: 'NO_NAME', cat: 'info', sev: 'warning', on: true, label: 'No street name',
+    { id: 'NO_NAME', cat: 'info', sev: 'error', on: true, label: 'No address at all (no street, no city, no state)',
+      test: (s, c) => NAMED_TYPES.has(s.roadType) && s.junctionId == null && !nameOf(s, c) && !cityOk(streetOf(s, c), c) },
+    { id: 'NO_STREET_CITY', cat: 'info', sev: 'warning', on: false, label: 'No street and no city (only the state is set)',
+      test: (s, c) => NAMED_TYPES.has(s.roadType) && s.junctionId == null && !nameOf(s, c) && !cityOk(streetOf(s, c), c) },
+    { id: 'NO_STREET', cat: 'info', sev: 'warning', on: false, label: 'No street name (even if WME shows a city or state)',
       test: (s, c) => NAMED_TYPES.has(s.roadType) && s.junctionId == null && !nameOf(s, c) },
     { id: 'NO_STATE', cat: 'info', sev: 'warning', on: true, label: 'City has no state',
       test: (s, c) => NAMED_TYPES.has(s.roadType) && !!nameOf(s, c) && cityOk(streetOf(s, c), c) && stateMissing(streetOf(s, c), c) },
@@ -619,6 +706,13 @@
       test: nearMiss },
     { id: 'OVERLAP', cat: 'topology', sev: 'warning', on: false, slow: true, label: 'Overlapping segments (same elevation)',
       test: overlap },
+    { id: 'ZERO_LEN', cat: 'geometry', sev: 'error', on: true, label: 'Zero-length segment (under 1 m)', test: (s) => zeroLen(s) },
+    { id: 'STUCK_VERTEX', cat: 'geometry', sev: 'warning', on: true, label: 'Stuck vertex: a geometry point sits on the end node', test: (s) => stuckVertex(s) },
+    { id: 'SHARP_ANGLE', cat: 'geometry', sev: 'warning', on: false, label: 'Sharp geometry angle (under 90 degrees inside one segment)', test: (s) => sharpAngle(s) },
+    { id: 'DUP_SEG', cat: 'topology', sev: 'error', on: true, slow: true, label: 'Duplicate segment: same nodes and same line, one hides the other', test: dupSeg },
+    { id: 'OVERLAP_ALONG', cat: 'topology', sev: 'warning', on: true, slow: true, label: 'Lies on top of another road (the road underneath is hidden)', test: alongOther },
+    { id: 'COINCIDENT_ENDS', cat: 'topology', sev: 'error', on: true, slow: true, label: 'Ends exactly on another road\'s end but not connected (missing junction)', test: coincidentEnds },
+    { id: 'CROSS_NO_JUNCTION', cat: 'topology', sev: 'warning', on: true, slow: true, label: 'Crosses another road at the same level without a junction', test: crossNoJunction },
     { id: 'UTURN_DEAD_END', cat: 'topology', sev: 'topology', on: false, slow: true, async: true, label: 'U-turn enabled at dead end',
       test: () => false },
     // --- Type continuity (heuristics on road class)
@@ -708,6 +802,9 @@
       test: v => plain(v) && !!(v.phone || '').trim() && !/^(0\d{1,2}-\d{3,4} \d{3,4}|1-\d{3}-\d{2}-\d{4})$/.test(v.phone.trim()) },
     { id: 'P_URL_FORMAT', sev: 'note', on: true, label: 'Website has http(s):// or tracking parameters (use www.example.com)',
       test: v => plain(v) && /^https?:\/\/|[?&](utm_|fbclid|gclid)/i.test((v.url || '').trim()) },
+    { id: 'G_CLOSED_LINKED', sev: 'error', on: true, label: 'Google says this place is permanently closed, and it is linked to a Waze place (WME data)', test: () => false },
+    { id: 'G_TEMP_LINKED', sev: 'warning', on: true, label: 'Google says this place is temporarily closed, and it is linked to a Waze place (WME data)', test: () => false },
+    { id: 'G_NOT_IN_WAZE', sev: 'note', on: false, label: 'Google place shown by WME with no Waze place linked yet (check it, add it if it is real)', test: () => false },
     { id: 'P_NO_EXT', sev: 'note', on: true, label: 'Not linked to a Google place (check it exists)', test: v => plain(v) && !(v.externalProviderIds || []).length },
     { id: 'P_DUP_LINK', sev: 'warning', on: true, label: 'Same Google place linked to 2+ places', test: (v, x) => x.dupLink.has(v.id) },
     { id: 'P_DUP_NEAR', sev: 'warning', on: true, label: 'Same name within 30 m', test: (v, x) => x.dupNear.has(v.id) },
@@ -788,7 +885,7 @@
   const RESULTS_KEY = 'wme-segment-validator:results:v1';
   const PTAGS_KEY = 'wme-segment-validator:place-tags:v1';   // places you marked checked / closed / moved   // swept sections + issues found, kept across reloads
   const PERSIST = ['enabled', 'autoMove', 'highlightOnly', 'autoSave', 'accumulate', 'loadMP', 'limitToViewport', 'abbrevPattern',
-    'extraWidth', 'nearMissM', 'layerOpacity', 'filterSev', 'filterRule', 'sortBy', 'hideVisited', 'zoomTo', 'selectOnJump', 'sweepZoom', 'bgEnabled', 'showSections', 'skipDone', 'placesOn', 'uiTab', 'pHideChecked', 'pSev', 'pRuleF', 'pMark', 'pSort', 'staleYears', 'mpHidden'];
+    'extraWidth', 'nearMissM', 'layerOpacity', 'filterSev', 'filterRule', 'sortBy', 'hideVisited', 'zoomTo', 'selectOnJump', 'sweepZoom', 'bgEnabled', 'showSections', 'skipDone', 'placesOn', 'uiTab', 'pHideChecked', 'pSev', 'pRuleF', 'pMark', 'pSort', 'staleYears', 'mpHidden', 'verbose', 'editBox'];
   let savedAreaKey = 'viewport';
   const kv = {
     get(k) { try { const t = localStorage.getItem(k); return t ? JSON.parse(t) : null; } catch (e) { return null; } },
@@ -835,6 +932,7 @@
       const done = new Set(Array.isArray(savedRes.done) ? savedRes.done : []);
       state.polygons.forEach(a => { a.done = done.has(a.name); });
       if (Array.isArray(savedRes.store)) savedRes.store.forEach(e => { if (e && e.id != null && e.geometry && Array.isArray(e.hits) && e.mid) state.store.set(e.id, e); });
+      if (Array.isArray(savedRes.seen)) savedRes.seen.forEach(id => { if (state.store.has(id)) state.visited.add(id); });
       state.restored = { done: done.size, issues: state.store.size, partial: !!savedRes.marksOnly };
     }
   }
@@ -854,7 +952,8 @@
   }
   function saveResults() {                          // swept sections (imported ones) + the issues found so far
     const done = state.polygons.filter(a => a.done).map(a => a.name);
-    let data = { v: 1, done, store: [...state.store.values()].map(e => ({ id: e.id, geometry: e.geometry, mid: e.mid, rt: e.rt, hits: e.hits })) };
+    const seen = [...state.visited].filter(id => state.store.has(id));
+    let data = { v: 1, done, seen, store: [...state.store.values()].map(e => ({ id: e.id, geometry: e.geometry, mid: e.mid, rt: e.rt, hits: e.hits })) };
     let txt = JSON.stringify(data);
     if (txt.length > 3.5e6) {                       // would not fit in browser storage: keep the marks, drop the issues, and say so
       data = { v: 1, done, store: [], marksOnly: true };
@@ -864,6 +963,8 @@
     }
     if (!kv.set(RESULTS_KEY, data)) setStatus('Browser storage is full: results are not remembered. Export CSV now.');
   }
+  let saveTimer = 0;
+  const saveResultsSoon = () => { clearTimeout(saveTimer); saveTimer = setTimeout(saveResults, 800); };
   const rememberOpen = (d, key, dflt) => {
     d.open = key in state.open ? !!state.open[key] : dflt;
     d.addEventListener('toggle', () => { state.open[key] = d.open; persistSoon(); });
@@ -873,7 +974,7 @@
   function abbrevRe() { try { return state.abbrevPattern ? new RegExp(state.abbrevPattern) : null; } catch (e) { warnOnce('abbrev-regex', e); return null; } }
   const worst = ids => ids.reduce((a, id) => (RANK[TIER[RULE_BY_ID[id].sev]] > RANK[a] ? TIER[RULE_BY_ID[id].sev] : a), 'note');
 
-  const NAME_RULES = new Set(['NO_NAME', 'NO_CITY', 'NO_STATE', 'LOWERCASE', 'ABBREV', 'EMPTY_ALT', 'NAME_ROUNDABOUT', 'CLOSED_NAME', 'CITY_RAIL_FWY']);
+  const NAME_RULES = new Set(['NO_NAME', 'NO_STREET_CITY', 'NO_STREET', 'NO_CITY', 'NO_STATE', 'LOWERCASE', 'ABBREV', 'EMPTY_ALT', 'NAME_ROUNDABOUT', 'CLOSED_NAME', 'CITY_RAIL_FWY']);
   const NEIGHBOUR_RULE = r => (r.cat === 'topology' && r.id !== 'LOOP' && r.id !== 'LOOP_SELF') || r.cat === 'continuity' || r.id === 'MEDIAN_UTURN';
   function neighboursLoaded(s, c) {                 // every segment on both end nodes is in the data model
     if (!c.nodeApi) return true;
@@ -889,15 +990,17 @@
     const ids = [s.primaryStreetId, ...(s.alternateStreetIds || [])].filter(i => i != null);
     return ids.every(i => { const st = c.streets.get(i); return st && (st.cityId == null || c.cities.has(st.cityId)); });
   }
+  let mdLogged = false;
   async function evaluate(cands, ctx) {
     const rules = RULES.filter(r => !r.async && state.rules[r.id]);      // unticked rules are not evaluated at all
     const out = new Map();
     let skipNb = 0, skipNm = 0;
+    if (!mdLogged && cands.length) { mdLogged = true; log.info(`segment sample: id=${cands[0].id} modificationData=${fmt(cands[0].modificationData)} keys=${Object.keys(cands[0]).join(',')}`); }
     for (const s of cands) {
       const hits = [];
       const full = neighboursLoaded(s, ctx), named = namesKnown(s, ctx);
       if (!full) skipNb++;
-      if (!named) skipNm++;
+      if (!named) { skipNm++; if (nameSkips++ < 3) log.info(`names not resolved for #${s.id}: primaryStreetId=${s.primaryStreetId} alt=${(s.alternateStreetIds || []).join(',')} roadType=${s.roadType}`); }
       for (const r of rules) {
         if (!full && NEIGHBOUR_RULE(r)) continue;       // would report phantom dead ends / extra nodes while neighbours are still loading
         if (!named && NAME_RULES.has(r.id)) continue;   // street or city record not loaded yet: unknown, not "missing"
@@ -906,7 +1009,8 @@
       out.set(s.id, hits);
     }
     state.skip = { nb: skipNb, nm: skipNm };
-    if (state.rules.NO_NAME || state.rules.NO_CITY || state.rules.NO_STATE) await addressPass(cands, out);
+    if (state.rules.NO_NAME || state.rules.NO_STREET_CITY || state.rules.NO_STREET || state.rules.NO_CITY || state.rules.NO_STATE) await addressPass(cands, out);
+    if (state.rules.MEDIAN_UTURN) await medianExemptPass(cands, out);
     if (state.rules.MEDIAN_UTURN) await medianTurnPass(cands, ctx, out);
     if (state.rules.UTURN_DEAD_END) await uturnPass(cands, ctx, out);
     if (state.rules.BDP) await bdpPass(cands, ctx, out);
@@ -921,22 +1025,46 @@
       while (i < items.length) { const k = i++; try { await fn(items[k], k); } catch (e) { warnOnce('pool', e); } }
     }));
   }
-  let addrLogged = false;
+  let addrLogged = false, addrDrops = 0, nameSkips = 0;
   async function addressPass(cands, out) {          // WME's own resolved address is the final word on missing name / city / state
-    const todo = cands.filter(s => { const h = out.get(s.id); return h && (h.includes('NO_NAME') || h.includes('NO_CITY') || h.includes('NO_STATE')); });
+    const todo = cands.filter(s => { const h = out.get(s.id); return h && (h.includes('NO_NAME') || h.includes('NO_STREET_CITY') || h.includes('NO_STREET') || h.includes('NO_CITY') || h.includes('NO_STATE')); });
     await pool(todo, 8, async s => {
       try {
         const a = await sdk.DataModel.Segments.getAddress({ segmentId: s.id });
-        if (!addrLogged) { addrLogged = true; log.info(`getAddress sample: ${fmt(a).slice(0, 600)}`); }
-        const nm = a && ((a.street && a.street.name) || a.streetName);
-        const ct = a && ((a.city && a.city.name) || a.cityName);
-        const stt = a && ((a.state && a.state.name) || a.stateName);
+        if (!addrLogged) { addrLogged = true; log.info(`getAddress sample: keys=${Object.keys(a || {}).join(',')} state=${fmt(a && a.state).slice(0, 160)} ${fmt(a).slice(0, 400)}`); }
+        const real = x => (typeof x === 'string' ? x : x && !x.isEmpty && x.name) ? String(typeof x === 'string' ? x : x.name).trim() : '';   // an "empty" street / city record is not a name
+        const nm = a && (real(a.street) || real(a.streetName));
+        const ct = a && (real(a.city) || real(a.cityName));
+        const stt = a && (real(a.state) || real(a.stateName));
         let hits = out.get(s.id);
-        if (nm) hits = hits.filter(x => x !== 'NO_NAME');
+        if (hits.includes('NO_NAME') && nm && addrDrops++ < 3) log.info(`address pass dropped NO_NAME for #${s.id}: ${fmt(a).slice(0, 300)}`);
+        if (nm || ct || stt) hits = hits.filter(x => x !== 'NO_NAME');      // error only when street, city AND state are all empty
+        if (nm || ct || !stt) hits = hits.filter(x => x !== 'NO_STREET_CITY');   // yellow variant: state is set, street and city are not
+        if (nm) hits = hits.filter(x => x !== 'NO_STREET');
         if (ct) hits = hits.filter(x => x !== 'NO_CITY');
         if (stt) hits = hits.filter(x => x !== 'NO_STATE');
         out.set(s.id, hits);
-      } catch (e) { warnOnce('getAddress', e); }
+      } catch (e) { warnOnce('getAddress', e); out.set(s.id, (out.get(s.id) || []).filter(x => x !== 'NO_STREET_CITY')); }
+    });
+  }
+  let medianCountryLogged = false;
+  async function medianExemptPass(cands, out) {   // drop median U-turn flags where Waze's penalty does not apply
+    const todo = cands.filter(s => (out.get(s.id) || []).includes('MEDIAN_UTURN'));
+    if (!todo.length) return;
+    let us = false;                               // penalty disabled in the United States (Dec 2021)
+    try {
+      const k = await sdk.DataModel.Countries.getTopCountry();
+      us = !!k && k.abbr === 'US';
+      if (k && !medianCountryLogged) { medianCountryLogged = true; log.info(`median U-turn check: top country abbr=${k.abbr} name=${k.name} penaltyDisabled=${us}`); }
+    } catch (e) { warnOnce('median-country', e); }
+    const S = sdk.DataModel.Segments;
+    await pool(todo, 8, async s => {
+      let exempt = us;
+      if (!exempt) try {                          // a junction box on either end node, or around the segment, overrides the penalty
+        const a = { segmentId: s.id };
+        exempt = await S.isFromNodeInBigJunction(a) || await S.isToNodeInBigJunction(a) || await S.isContainedInBigJunction(a);
+      } catch (e) { warnOnce('median-jb', e); }   // could not ask: keep the flag
+      if (exempt) out.set(s.id, out.get(s.id).filter(x => x !== 'MEDIAN_UTURN'));
     });
   }
   async function medianTurnPass(cands, ctx, out) {  // keep a median U-turn flag only if WME says both turns are really allowed (a blocked turn means no U-turn anyway)
@@ -1224,6 +1352,14 @@
     if (ui.sweepBtn) ui.sweepBtn.textContent = 'Sweep area';
     if (ui.pauseBtn) { ui.pauseBtn.textContent = 'Pause'; ui.pauseBtn.disabled = true; }
   }
+  // WME's own Google Places tab re-queries Google on every map move; our sweep moves the map a lot and the server answers 502.
+  function googleTabOpen() {
+    try {
+      if (new URLSearchParams(location.search).get('tab') === 'google_places') return true;
+      const el = [...document.querySelectorAll('#sidebar label, #sidebar span, #sidebar wz-checkbox')].find(n => /Update results when map moves/i.test(n.textContent || ''));
+      return !!(el && el.offsetParent !== null);
+    } catch (e) { return false; }
+  }
   async function toggleSweep() {
     if (state.sweeping) { state.sweepCancel = true; state.sweepPaused = false; return setStatus('Stopping sweep...'); }
     const areas = areasForKey();
@@ -1256,6 +1392,12 @@
           const p0 = Date.now();
           setStatus(`Sweep paused at ${i + 1}/${tiles.length} \u00B7 ${state.store.size} segments with issues. Press Resume to continue.`);
           while (state.sweepPaused && !state.sweepCancel) await sleep(200);
+          pausedMs += Date.now() - p0;
+          if (state.sweepCancel) break;
+        }
+        if (googleTabOpen()) {                      // do not move the map while WME's Google Places tab is open
+          const p0 = Date.now();
+          while (googleTabOpen() && !state.sweepCancel) { setStatus(`Sweep waiting at ${i + 1}/${tiles.length}: leave the Google Places tab and it continues.`); await sleep(1000); }
           pausedMs += Date.now() - p0;
           if (state.sweepCancel) break;
         }
@@ -1403,6 +1545,45 @@
     }
     return polys;
   }
+  // ---- import a results CSV (made by Export CSV) back into the issue list
+  function parseCsvText(t) {
+    const rows = []; let row = [], f = '', q = false;
+    t = t.replace(/^\uFEFF/, '');
+    for (let i = 0; i < t.length; i++) {
+      const c = t[i];
+      if (q) { if (c === '"') { if (t[i + 1] === '"') { f += '"'; i++; } else q = false; } else f += c; }
+      else if (c === '"') q = true;
+      else if (c === ',') { row.push(f); f = ''; }
+      else if (c === '\n' || c === '\r') { if (c === '\r' && t[i + 1] === '\n') i++; row.push(f); f = ''; if (row.some(x => x !== '')) rows.push(row); row = []; }
+      else f += c;
+    }
+    if (f !== '' || row.length) { row.push(f); if (row.some(x => x !== '')) rows.push(row); }
+    return rows;
+  }
+  async function isResultsCsv(file) {
+    if (!/\.csv$/i.test(file.name)) return false;
+    const head = (await file.slice(0, 400).text()).replace(/^\uFEFF/, '');
+    return /segment_id/.test(head) && /rule_ids/.test(head);
+  }
+  async function importResultsCsv(file) {
+    const rows = parseCsvText(await file.text());
+    const col = Object.fromEntries((rows.shift() || []).map((n, i) => [n.trim(), i]));
+    let added = 0, skipped = 0;
+    for (const r of rows) {
+      const id = Number(r[col.segment_id]);
+      const hits = String(r[col.rule_ids] || '').split(/\s+/).filter(h => RULE_BY_ID[h]);
+      const lon = Number(r[col.lon]), lat = Number(r[col.lat]);
+      if (!Number.isFinite(id) || !hits.length || !Number.isFinite(lon) || !Number.isFinite(lat)) { skipped++; continue; }
+      let coords = null;
+      try { coords = JSON.parse(r[col.geometry]); } catch (e) { /* older CSV: no geometry */ }
+      if (!Array.isArray(coords) || coords.length < 2) coords = [[lon - 0.00001, lat], [lon + 0.00001, lat]];   // short stand-in until the segment loads and is re-checked
+      const rt = Number(r[col.road_type_id]);
+      state.store.set(id, { id, geometry: { type: 'LineString', coordinates: coords }, mid: [lon, lat], rt: Number.isFinite(rt) && r[col.road_type_id] !== '' ? rt : 1, hits });
+      added++;
+    }
+    log.info(`imported results CSV ${file.name}: ${added} issue(s), ${skipped} skipped`);
+    return { added, skipped };
+  }
   async function importFile(file) {
     let polys;
     if (/\.(wkt|txt|csv)$/i.test(file.name)) polys = parseWkt(await file.text()).map(geometry => ({ geometry, name: '' }));
@@ -1519,6 +1700,7 @@
       const cands = [...targets.values()];
       if (cands.length) commit(cands, await evaluate(cands, ctx));
       await refreshView();
+      saveResultsSoon();
       setStatus(`Edit check: ${cands.length} segments re-validated \u00B7 ${state.view.length} issues`);
     } finally {
       liveBusy = false;
@@ -1546,6 +1728,7 @@
       const cands = [...targets.values()];
       commit(cands, await evaluate(cands, ctx));
       await refreshView();
+      saveResultsSoon();
       setStatus(`Save check: ${cands.length} segments re-validated \u00B7 ${state.view.length} issues`);
       log.info(`save check ids=${ids.length} revalidated=${cands.length} missing=${missing}`);
       if (missing && state.autoMove) run();         // new segments get new ids after a save: fall back to a normal scan
@@ -1584,6 +1767,45 @@
     renderList();
     paintListWindowSoon();
   }
+  // Short "what it means / what to do" text shown when Detailed issues is ticked.
+  const HINTS = {
+    MP_OPEN: 'WME already has an open map problem here. Open it in the map problem panel and resolve it.',
+    NO_NAME: 'Street, city and state are all empty. At least set the state (and city or street where known).',
+    NO_STREET_CITY: 'Only the state is set. Often acceptable; tick this rule only if you want these listed.',
+    NO_STREET: 'The segment has no street name. Add a name, or set "No street" for an unnamed road.',
+    NO_CITY: 'Named street without a city. Pick the city, or set "No city" on purpose.',
+    NO_STATE: 'The city has no state. Set the state on the city.',
+    UNKNOWN_DIR: 'Direction is unknown, so Waze cannot route it. Set two-way or one-way.',
+    SHORT: 'Very short segment that is not a dead end. Merge or remove it unless it is a needed junction piece.',
+    MEDIAN_UTURN: 'A U-turn over a short median (under 16 m): Waze penalises it. If the U-turn should be allowed, lengthen the median or add a node in the middle. Not flagged in the US or at a junction box.',
+    LOOP_SELF: 'One segment starts and ends on the same node. Add a junction node so the loop has 3+ segments.',
+    LOOP: 'Two segments share both end nodes. Add a junction node to make 3 segments.',
+    UNCONNECTED: 'Not joined to any other segment. Connect it to the road network, or delete it.',
+    ONEWAY_TRAP: 'One-way road leads nowhere: cars can enter but cannot leave. Fix the direction or connect the exit.',
+    ONEWAY_NOENTRY: 'One-way road cannot be entered. Fix the direction or connect the entry.',
+    UNNEEDED_NODE: 'Two identical segments meet at a node that adds nothing. Remove the node (merge).',
+    BC_NOT_STRAIGHT: 'At this fork the straight road is not the best continuation, so Waze may give a wrong turn instruction. Check names and road types, or set a TIO.',
+    BC_TIE: 'Two roads tie as best continuation at a fork. Make names or road types differ, or set a TIO.',
+    BDP: 'Big Detour Prevention: this detour leaves and rejoins a highway while a direct route exists.',
+    OVERLAP: 'Two roads leave a node in almost the same direction. Separate them or merge them.',
+    NEAR_MISS: 'Two segments end very close but are not joined. Connect them if they meet in real life.',
+    ZERO_LEN: 'The two ends are under 1 m apart. Delete the segment or merge its nodes.',
+    STUCK_VERTEX: 'A geometry point sits on the first or last node and distorts turn angles. Delete the extra point.',
+    SHARP_ANGLE: 'The line folds back on itself inside one segment (often an accidental drag). Straighten it, or split if it is a real hairpin.',
+    DUP_SEG: 'Two segments have the same nodes and shape. Delete one.',
+    OVERLAP_ALONG: 'This segment runs along another road, so the road underneath is hidden (look for a red turn arrow). Delete or move one of them, and connect properly.',
+    COINCIDENT_ENDS: 'Two segment ends are on the same spot but have different nodes. Connect them into one node.',
+    CROSS_NO_JUNCTION: 'These roads cross at the same level but share no node. Add a junction, or set different elevations for a bridge.',
+    P_NO_NAME: 'The place has no name.',
+    P_NO_STREET: 'The address has no street. Add the street from the address field.',
+    P_HN_SPACE: 'House number has a space. Remove the space (12A, not 12 A).',
+    P_NO_EXT: 'Not linked to a Google place. Link it, or check that the place exists.',
+    P_DUP_LINK: 'The same Google place is linked to two or more Waze places. Merge or relink.',
+    P_DUP_NEAR: 'Same name within 30 m. Check for a duplicate and merge it.',
+    G_CLOSED_LINKED: 'Google says permanently closed, but a Waze place is linked. Verify, then delete or update the Waze place.',
+    G_TEMP_LINKED: 'Google says temporarily closed. Check, and mark the place temporarily closed if appropriate.',
+    G_NOT_IN_WAZE: 'Google shows this place but no Waze place is linked. Check whether it should be added.'
+  };
   function renderList() {
     const keepScroll = ui.list.scrollTop;            // rebuilding the list must not move it
     const v = state.view;
@@ -1621,7 +1843,12 @@
         row.title = labels.join('\n');
         row.style.cssText = `padding:3px 4px;border-left:6px solid ${PALETTE[sev]};border-bottom:1px solid #eee;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;` +
           (state.visited.has(e.id) ? 'opacity:.55;' : '') + (e.id === state.currentId ? 'background:#e3f2fd;' : '');
-        row.textContent = `#${e.id}  ${labels.join(' · ')}` + (state.sortBy === 'distance' && e.dist != null ? `  · ${fmtDist(e.dist)}` : '');
+        const dist = state.sortBy === 'distance' && e.dist != null ? `  · ${fmtDist(e.dist)}` : '';
+        if (state.verbose) {
+          row.style.whiteSpace = 'normal'; row.style.overflow = 'visible';
+          row.append(h('div', { textContent: `#${e.id}${dist}`, style: 'font-weight:bold' }));
+          for (const id of e.vis) row.append(h('div', { textContent: `\u2022 ${RULE_BY_ID[id].label}${HINTS[id] ? ' \u2014 ' + HINTS[id] : ''}`, style: 'font-size:12px;margin-left:6px;color:#333' }));
+        } else row.textContent = `#${e.id}  ${labels.join(' \u00B7 ')}${dist}`;
         row.onclick = () => goTo(e);
         ui.list.append(row);
       }
@@ -1671,7 +1898,26 @@
       catch (err) { log.info('selection not applied', err && err.message); }
     }
     log.info(`go to #${e.id} ${e.vis.join(',')}`);
+    await recheckOne(e.id);
     await refreshView();
+    saveResultsSoon();
+  }
+  // A listed issue may have been fixed since the scan (even in an earlier session): re-check it when you open it.
+  async function recheckOne(id) {
+    try {
+      await waitMapIdle(3000);
+      const all = await sdk.DataModel.Segments.getAll();
+      const ctx = await buildContext(all);
+      const s = ctx.seg.get(id);
+      if (!s) return;                                 // not loaded here: leave the entry alone
+      const targets = new Map([[id, s]]);
+      ends(s).forEach(n => at(ctx, n).forEach(t => targets.set(t.id, t)));
+      const cands = [...targets.values()];
+      const had = state.store.size;
+      commit(cands, await evaluate(cands, ctx));
+      if (!state.store.has(id)) { setStatus(`#${id} is already fixed: removed from the list`); state.currentId = null; }
+      else if (state.store.size !== had) setStatus(`Re-checked #${id}: list updated`);
+    } catch (err) { log.warn('re-check on open failed', err); }
   }
   function step(dir) {
     const v = state.view;
@@ -1839,11 +2085,12 @@
   const exportRows = () => [
     ...state.view.map(e => ({ e, segment_id: e.id, severity: SEV_NAME[e.sev].replace(/s$/, ''), rule_ids: e.vis.join(' '),
       issues: e.vis.map(id => RULE_BY_ID[id].label).join('; '), road_type: roadTypeName(e.rt),
-      lon: e.mid[0].toFixed(6), lat: e.mid[1].toFixed(6), link: permalinkFor(e.mid[0], e.mid[1], e.id) })),
+      lon: e.mid[0].toFixed(6), lat: e.mid[1].toFixed(6), link: permalinkFor(e.mid[0], e.mid[1], e.id),
+      road_type_id: e.rt, geometry: JSON.stringify(e.geometry.coordinates.map(c => [+c[0].toFixed(6), +c[1].toFixed(6)])) })),
     ...[...bg.points.values()].map(o => ({ e: null, segment_id: '', severity: 'Map problem', rule_ids: 'MAP_PROBLEM', issues: `${mpName(o)} (#${o.id})`,
       road_type: '', lon: o.lon.toFixed(6), lat: o.lat.toFixed(6), link: permalinkFor(o.lon, o.lat, null) })),
   ];
-  const CSV_COLS = ['segment_id', 'severity', 'rule_ids', 'issues', 'road_type', 'lon', 'lat', 'link'];
+  const CSV_COLS = ['segment_id', 'severity', 'rule_ids', 'issues', 'road_type', 'lon', 'lat', 'link', 'road_type_id', 'geometry'];
   function toCsv(rows) {
     const esc = v => { const t = String(v ?? ''); return /[",\r\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t; };
     return '﻿' + [CSV_COLS.join(','), ...rows.map(r => CSV_COLS.map(c => esc(r[c])).join(','))].join('\r\n');   // BOM so Excel reads UTF-8
@@ -1984,9 +2231,51 @@
         if (hits.length) state.pstore.set(v.id, { id: v.id, mid: m, name: (v.name || '').trim(), exts: v.externalProviderIds || [], hits });
         else state.pstore.delete(v.id);
       }
+      try { googlePass(extent); } catch (e) { warnOnce('google-pass', e); }
       await renderPlaces();
       setPStatus(`Scanned ${cands.length} places · ${state.pview.length} with issues`);
     } catch (e) { log.error('place scan failed', e); setPStatus('Place scan error, copy the debug log'); }
+  }
+  // ---- Google places that WME itself has loaded (W.model.googlePlaces, the layer you see in WME). Read only, kept in memory,
+  // never saved or sent anywhere. This is WME internals, not the SDK: it can stop working after a WME update (then it just does nothing).
+  let gpLogged = false;
+  function googlePass(extent) {
+    for (const k of [...state.pstore.keys()]) if (String(k).startsWith('g:')) state.pstore.delete(k);
+    if (!(state.pRules.G_CLOSED_LINKED || state.pRules.G_TEMP_LINKED || state.pRules.G_NOT_IN_WAZE)) return;
+    const mdl = window.W && W.model && W.model.googlePlaces;
+    if (!mdl || typeof mdl.getObjectArray !== 'function') return warnOnce('gp-missing', 'W.model.googlePlaces not found: Google place checks skipped');
+    const A = o => (o && (o.attributes || (o.getAttributes && o.getAttributes()))) || o || {};
+    const nameOf = a => {
+      const d = a.displayNames;
+      const t = x => (typeof x === 'string' ? x : x && (x.text || x.name || x.displayName)) || '';
+      if (Array.isArray(d)) return t(d[0]);
+      if (typeof d === 'string') return d;
+      if (d && typeof d === 'object') return t(d) || t(Object.values(d)[0]);
+      return '';
+    };
+    const arr = mdl.getObjectArray() || [];
+    if (!gpLogged && arr.length) { gpLogged = true; const a0 = A(arr[0]); log.info(`google places in WME: ${arr.length}; fields: ${Object.keys(a0).join(',')}; businessStatus=${fmt(a0.businessStatus)} linked=${fmt(a0.linkedWazeVenueIds)} displayNames=${fmt(a0.displayNames).slice(0, 120)}`); }
+    const areas = state.scope === 'viewport' ? null : areasForKey();
+    let kept = 0;
+    for (const o of arr) {
+      const a = A(o), geo = a.geoJSONGeometry;
+      const mid = geo && geo.coordinates ? placeMid({ geometry: geo }) : null;
+      if (!mid) continue;
+      if (areas) { if (!areas.some(ar => mid[0] >= ar.bbox[0] && mid[0] <= ar.bbox[2] && mid[1] >= ar.bbox[1] && mid[1] <= ar.bbox[3] && polygonContains(mid, ar.geometry))) continue; if (state.limitToViewport && !(mid[0] >= extent[0] && mid[0] <= extent[2] && mid[1] >= extent[1] && mid[1] <= extent[3])) continue; }
+      else if (!(mid[0] >= extent[0] && mid[0] <= extent[2] && mid[1] >= extent[1] && mid[1] <= extent[3])) continue;
+      const linked = Array.isArray(a.linkedWazeVenueIds) ? a.linkedWazeVenueIds : [];
+      const st = String(a.businessStatus == null ? '' : a.businessStatus).toUpperCase();
+      const perm = /PERMANENT/.test(st), temp = /TEMPOR/.test(st);
+      const hits = [];
+      if (linked.length && perm && state.pRules.G_CLOSED_LINKED) hits.push('G_CLOSED_LINKED');
+      if (linked.length && temp && state.pRules.G_TEMP_LINKED) hits.push('G_TEMP_LINKED');
+      if (!linked.length && !perm && !temp && state.pRules.G_NOT_IN_WAZE) hits.push('G_NOT_IN_WAZE');
+      if (!hits.length) continue;
+      const gid = String(a.id == null ? o.id : a.id);
+      state.pstore.set(`g:${gid}`, { id: `g:${gid}`, isG: true, gid, linked, mid, name: `Google: ${nameOf(a) || '(no name)'}`, exts: [gid], hits });
+      kept++;
+    }
+    if (kept) log.info(`google places flagged: ${kept} of ${arr.length} loaded by WME`);
   }
   function visiblePlaces(skipRule) {
     let a = [];
@@ -2051,7 +2340,7 @@
       const tag = state.placeTags[e.id];
       const row = h('div', { style: `padding:4px 6px;border-left:6px solid ${tag ? '#9e9e9e' : PALETTE[e.sev]};border-bottom:1px solid #ddd;cursor:pointer;` + (e.id === state.pCur ? 'background:#e3f2fd;' : '') + (tag ? 'opacity:.65;' : '') });
       const head = h('div', { style: 'display:flex;gap:4px;align-items:center' });
-      const open = pAllOpen || pOpen.has(e.id);
+      const open = state.verbose || pAllOpen || pOpen.has(e.id);
       const arrow = h('button', { textContent: `${open ? '▾' : '▸'} ${e.vis.length}`, title: open ? 'Hide the issue tags' : 'Show the issue tags', style: `font-size:11px;padding:0 5px;color:#fff;background:${PALETTE[e.sev]};border:0;border-radius:3px;cursor:pointer` });
       arrow.onclick = ev => { ev.stopPropagation(); if (pAllOpen) { pAllOpen = false; v.forEach(x => { if (x.id !== e.id) pOpen.add(x.id); }); pOpen.delete(e.id); } else if (pOpen.has(e.id)) pOpen.delete(e.id); else pOpen.add(e.id); renderPlaceList(); };
       head.append(h('span', { textContent: `${icons[tag] || ''} ${e.name || '(no name)'}`, style: 'flex:1;font-weight:bold;word-break:break-word' }), arrow);
@@ -2061,7 +2350,8 @@
       t.onclick = ev => { ev.stopPropagation(); cycleTag(e.id); };
       head.append(g, t);
       const issues = h('div', { style: 'margin-top:2px;display:flex;flex-wrap:wrap;gap:3px' });
-      for (const id of e.vis) issues.append(h('span', { textContent: PRULE_BY_ID[id].label, title: PRULE_BY_ID[id].custom ? 'Custom check' : id, style: `font-size:11px;border:1px solid ${PALETTE[TIER[PRULE_BY_ID[id].sev]]};border-radius:3px;padding:0 4px;background:#fff` }));
+      if (state.verbose) { issues.style.flexDirection = 'column'; issues.style.gap = '1px'; }
+      for (const id of e.vis) issues.append(h('span', { textContent: state.verbose ? `\u2022 ${PRULE_BY_ID[id].label}${HINTS[id] ? ' \u2014 ' + HINTS[id] : ''}` : PRULE_BY_ID[id].label, title: PRULE_BY_ID[id].custom ? 'Custom check' : id, style: `font-size:11px;border:1px solid ${PALETTE[TIER[PRULE_BY_ID[id].sev]]};border-radius:3px;padding:0 4px;background:#fff` }));
       row.append(head);
       if (open) row.append(issues);
       row.onclick = () => goToPlace(e);
@@ -2089,16 +2379,16 @@
         await sdk.Map.setMapCenter({ lonLat: { lon: e.mid[0], lat: e.mid[1] }, zoomLevel: clampZoom(Math.max(cur, state.zoomTo)) });
       } catch (err) { log.warn('go to place', err); }
     }
-    if (state.selectOnJump) {
+    if (state.selectOnJump && (!e.isG || (e.linked && e.linked.length))) {
       await waitMapIdle();
-      try { await sdk.Editing.setSelection({ selection: { ids: [String(e.id)], objectType: 'venue' } }); }
+      try { await sdk.Editing.setSelection({ selection: { ids: [String(e.isG ? e.linked[0] : e.id)], objectType: 'venue' } }); }
       catch (err) { log.info('place selection not applied', err && err.message); }
     }
     await renderPlaces();
   }
   function exportPlacesCsv() {
     const rows = state.pview.map(e => {
-      const u = new URL(permalinkFor(e.mid[0], e.mid[1], null)); u.searchParams.set('venues', String(e.id));
+      const u = new URL(permalinkFor(e.mid[0], e.mid[1], null)); if (!e.isG) u.searchParams.set('venues', String(e.id));
       return { place_id: e.id, name: e.name, severity: SEV_NAME[e.sev].replace(/s$/, ''), rule_ids: e.vis.join(' '), issues: e.vis.map(id => PRULE_BY_ID[id].label).join('; '),
         mark: state.placeTags[e.id] || '', lon: e.mid[0].toFixed(6), lat: e.mid[1].toFixed(6), google_link: googleLinkFor(e), editor_link: u.toString() };
     });
@@ -2378,7 +2668,15 @@
       if (!files.length) return;
       const before = state.polygons.length;
       for (const f of files) {
-        try { setStatus(`Importing ${f.name}...`); await importFile(f); }
+        try {
+          if (await isResultsCsv(f)) {
+            const r = await importResultsCsv(f);
+            await refreshView(); saveResults();
+            setStatus(`Restored ${r.added} issue(s) from ${f.name}${r.skipped ? ` (${r.skipped} rows skipped)` : ''}. Click an item to re-check it.`);
+            continue;
+          }
+          setStatus(`Importing ${f.name}...`); await importFile(f);
+        }
         catch (e) { log.error('import failed', f.name, e); setStatus(`Import failed: ${e.message}`); }
       }
       const added = state.polygons.length - before;
@@ -2438,7 +2736,9 @@
         v => { state.sortBy = v; refreshView(); }));
     const results = section('Error list', true,
       filters,
+      mkCheck('Show issues under the address of the selected segment / place', state.editBox, v => { state.editBox = v; persistSoon(); paintEditBox(); }),
       mkCheck('Hide visited', state.hideVisited, v => { state.hideVisited = v; refreshView(); }),
+      mkCheck('Detailed issues (one per line, with a hint)', state.verbose, v => { state.verbose = v; persistSoon(); refreshView(); if (typeof renderPlaceList === 'function') renderPlaceList(); }),
       h('div', { style: 'font-size:11px;margin-top:4px' },
         ...['error', 'warning', 'note'].map(k => h('span', { style: 'margin-right:10px' }, h('span', { textContent: '\u25CF ', style: `color:${PALETTE[k]}` }), SEV_NAME[k]))),
       h('div', { style: 'margin-top:4px' }, mkBtn('\u25C0 Prev', () => step(-1)), ui.pos, mkBtn('Next \u25B6', () => step(1))),
@@ -2537,6 +2837,86 @@
     return box;
   }
 
+  // ------------------------------------------- issues box inside WME's own edit panel (selected segment / place)
+  // WME's panel markup is not part of the SDK, so the box is placed by looking for the "Alternate addresses" heading. If that is not found it
+  // goes to the top of the panel. A MutationObserver puts it back when WME redraws the panel.
+  const BOX_ID = 'wmesv-edit-box';
+  let boxData = null, boxObs = null, boxSeq = 0;
+  function boxAnchor(panel) {
+    const w = document.createTreeWalker(panel, NodeFilter.SHOW_TEXT);
+    let n;
+    while ((n = w.nextNode())) { if (/^\s*Alternate (addresses|names)\s*$/i.test(n.nodeValue) && n.parentElement) return n.parentElement; }
+    return null;
+  }
+  function placeBox() {
+    const panel = document.querySelector('#edit-panel');
+    const old = document.getElementById(BOX_ID);
+    if (!boxData || !panel) { if (old) old.remove(); return; }
+    if (old && panel.contains(old) && old.dataset.key === boxData.key) return;
+    if (old) old.remove();
+    const box = document.createElement('div');
+    box.id = BOX_ID; box.dataset.key = boxData.key;
+    box.style.cssText = 'margin:6px 0;padding:6px 8px;border:1px solid #ddd;border-left:5px solid ' + boxData.color + ';border-radius:4px;background:#fffdf5;font-size:12px;line-height:1.4';
+    const t = document.createElement('div');
+    t.textContent = boxData.title; t.style.cssText = 'font-weight:bold;margin-bottom:2px';
+    box.append(t);
+    for (const it of boxData.items) {
+      const r = document.createElement('div');
+      r.style.cssText = 'margin-top:2px';
+      const dot = document.createElement('span');
+      dot.textContent = '\u25CF '; dot.style.color = it.color;
+      const b = document.createElement('b'); b.textContent = it.label;
+      r.append(dot, b);
+      if (it.hint) { const hs = document.createElement('span'); hs.textContent = ' \u2014 ' + it.hint; r.append(hs); }
+      box.append(r);
+    }
+    const a = boxAnchor(panel);
+    if (a) a.parentElement.insertBefore(box, a);
+    else { const host = panel.querySelector('.tab-content, wz-tab-content, [role="tabpanel"]') || panel; host.prepend(box); }
+  }
+  function ensureBoxObserver() {
+    if (boxObs) return;
+    const panel = document.querySelector('#edit-panel');
+    if (!panel) return;
+    let t = 0;
+    boxObs = new MutationObserver(() => { clearTimeout(t); t = setTimeout(() => { try { placeBox(); } catch (e) { warnOnce('edit-box', e); } }, 250); });
+    boxObs.observe(panel, { childList: true, subtree: true });
+  }
+  async function paintEditBox() {
+    const seq = ++boxSeq;
+    try {
+      if (!state.enabled || !state.editBox) { boxData = null; return placeBox(); }
+      const sel = await sdk.Editing.getSelection();
+      if (seq !== boxSeq) return;
+      if (!sel || !sel.ids || sel.ids.length !== 1) { boxData = null; return placeBox(); }
+      const id = sel.ids[0], type = String(sel.objectType || '');
+      let items = null, title = '';
+      if (type === 'segment') {
+        const all = await sdk.DataModel.Segments.getAll();
+        const seg = all.find(x => String(x.id) === String(id));
+        if (!seg) { boxData = null; return placeBox(); }
+        const ctx = await buildContext(all, [seg]);
+        const hits = (await evaluate([seg], ctx)).get(seg.id) || [];
+        items = hits.map(h => ({ label: RULE_BY_ID[h].label, hint: HINTS[h] || '', sev: TIER[RULE_BY_ID[h].sev] }));
+        title = `Segment Validator: ${items.length ? items.length + ' issue' + (items.length > 1 ? 's' : '') : 'no issues found'}`;
+      } else if (type === 'venue') {
+        const e = state.pstore.get(String(id)) || state.pstore.get(id);
+        if (!e) { boxData = null; return placeBox(); }
+        const vis = e.hits.filter(h => state.pRules[h] && PRULE_BY_ID[h]);
+        items = vis.map(h => ({ label: PRULE_BY_ID[h].label, hint: HINTS[h] || '', sev: TIER[PRULE_BY_ID[h].sev] }));
+        title = `Place Validator: ${items.length ? items.length + ' issue' + (items.length > 1 ? 's' : '') + ' (last scan)' : 'no issues in last scan'}`;
+      } else { boxData = null; return placeBox(); }
+      if (seq !== boxSeq) return;
+      const worstSev = items.reduce((w, i) => (RANK[i.sev] > RANK[w] ? i.sev : w), 'note');
+      boxData = { key: `${type}:${id}:${items.map(i => i.label).join('|')}`, title, color: items.length ? PALETTE[worstSev] : '#4caf50',
+        items: items.map(i => ({ label: i.label, hint: i.hint, color: PALETTE[i.sev] })) };
+      ensureBoxObserver();
+      placeBox();
+    } catch (e) { warnOnce('edit-box-paint', e); }
+  }
+  let boxTimer = 0;
+  const paintEditBoxSoon = () => { clearTimeout(boxTimer); boxTimer = setTimeout(() => paintEditBox(), 350); };
+
   // ----------------------------------------------------------------- boot
   const debounce = (fn, ms) => { let t; return () => { clearTimeout(t); t = setTimeout(fn, ms); }; };
   const onScanError = e => { log.error('scan failed', e); setStatus('Scan error, copy the debug log'); };
@@ -2550,6 +2930,7 @@
   let nudging = false;
   async function nudgeMap(why) {
     if (nudging) return;
+    if (googleTabOpen()) return log.info('map nudge skipped: Google Places tab is open');
     nudging = true;
     try {
       const auto = why !== 'button';
@@ -2674,6 +3055,9 @@
     run = debounce(() => { if (state.sweeping) return; if (state.autoMove) scan().catch(onScanError); else setStatus('Settings changed. Press Scan Now.'); }, 500);
     ['wme-map-data-loaded', 'wme-map-zoom-changed', 'wme-map-move-end'].forEach(n => on(n, run));
     on('wme-after-edit', collectEdited);
+    on('wme-selection-changed', paintEditBoxSoon);
+    on('wme-after-edit', paintEditBoxSoon);
+    on('wme-save-finished', paintEditBoxSoon);
     ['wme-after-undo', 'wme-after-redo'].forEach(n => { try { on(n, collectEdited); } catch (e) { log.info(`event ${n} not available`); } });
     on('wme-save-finished', p => onSaveFinished(p).catch(e => log.error('save handler failed', e)));
     on('wme-map-move-end', updateHere);
