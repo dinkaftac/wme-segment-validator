@@ -6,7 +6,7 @@
 // @supportURL   https://github.com/dinkaftac/wme-segment-validator/issues
 // @updateURL    https://raw.githubusercontent.com/dinkaftac/wme-segment-validator/main/wme-segment-validator.user.js
 // @downloadURL  https://raw.githubusercontent.com/dinkaftac/wme-segment-validator/main/wme-segment-validator.user.js
-// @version      0.28.1
+// @version      0.28.2
 // @description  Segment validator: viewport / managed area / driven area / custom polygon (draw or shapefile), save-triggered re-checks, soft highlights under the roads, clickable error list. Official WME SDK only.
 // @match        https://www.waze.com/*/editor*
 // @match        https://beta.waze.com/*/editor*
@@ -23,7 +23,7 @@
 
   const ID = 'wme-segment-validator';
   const NAME = 'Segment Validator';
-  const VERSION = '0.28.1';
+  const VERSION = '0.28.2';
   const LAYER = 'segment-validator-highlights';
   const HALO_LAYER = 'segment-validator-current';   // halo behind the highlight for the focused segment
   const SCOPE_LAYER = 'segment-validator-scope';
@@ -205,7 +205,7 @@
       `User: ${userLine}`,
       `Highlight layer placed under native segments layer: ${state.underRoads}`,
       `Drive areas: source="${state.driveSource}" count=${state.driveAreas ? state.driveAreas.length : 'not loaded'}`,
-      `State: ${JSON.stringify({ enabled: state.enabled, autoMove: state.autoMove, autoSave: state.autoSave, scope: state.scope,
+      `State: ${JSON.stringify({ enabled: state.enabled, autoMove: state.autoMove, autoSave: state.autoSave, accumulate: state.accumulate, scope: state.scope,
         limitToViewport: state.limitToViewport, managedAreasLoaded: state.managedAreas.length, polygons: state.polygons.length,
         stored: state.store.size, shown: state.view.length, enabledRules: Object.keys(state.rules).filter(k => state.rules[k]) })}`,
       '--- SDK API check ---', apiCheck(),
@@ -994,6 +994,7 @@
   async function evaluate(cands, ctx) {
     const rules = RULES.filter(r => !r.async && state.rules[r.id]);      // unticked rules are not evaluated at all
     const out = new Map();
+    out.unknown = new Map();                       // segmentId -> what could not be verified this time (data not loaded)
     let skipNb = 0, skipNm = 0;
     if (!mdLogged && cands.length) { mdLogged = true; log.info(`segment sample: id=${cands[0].id} modificationData=${fmt(cands[0].modificationData)} keys=${Object.keys(cands[0]).join(',')}`); }
     for (const s of cands) {
@@ -1001,6 +1002,7 @@
       const full = neighboursLoaded(s, ctx), named = namesKnown(s, ctx);
       if (!full) skipNb++;
       if (!named) { skipNm++; if (nameSkips++ < 3) log.info(`names not resolved for #${s.id}: primaryStreetId=${s.primaryStreetId} alt=${(s.alternateStreetIds || []).join(',')} roadType=${s.roadType}`); }
+      if (!full || !named) out.unknown.set(s.id, { nb: !full, nm: !named });
       for (const r of rules) {
         if (!full && NEIGHBOUR_RULE(r)) continue;       // would report phantom dead ends / extra nodes while neighbours are still loading
         if (!named && NAME_RULES.has(r.id)) continue;   // street or city record not loaded yet: unknown, not "missing"
@@ -1225,7 +1227,13 @@
   }
   function commit(cands, out) {
     for (const s of cands) {
-      const hits = out.get(s.id) || [];
+      let hits = out.get(s.id) || [];
+      const old = state.store.get(s.id), un = out.unknown && out.unknown.get(s.id);
+      if (old && un) {                             // an issue that could not be re-verified stays listed: not loaded is not the same as fixed
+        const kept = old.hits.filter(id => { const r = RULE_BY_ID[id];
+          return r && state.rules[id] && ((un.nb && (NEIGHBOUR_RULE(r) || id === 'SHORT')) || (un.nm && NAME_RULES.has(id))); });
+        hits = [...new Set([...hits, ...kept])];
+      }
       if (hits.length) state.store.set(s.id, { id: s.id, geometry: s.geometry, mid: lineMidpoint(s.geometry.coordinates), rt: s.roadType, hits });
       else state.store.delete(s.id);
     }
@@ -1382,7 +1390,7 @@
       const tiles = groups.flatMap((g, gi) => tilesFor(g, ext[2] - ext[0], ext[3] - ext[1]).map(t => Object.assign(t, { g: gi })));
       log.info(`sweep: zoom ${z}, ${tiles.length} tiles`);
       if (tiles.length > 300 && !window.confirm(`This area needs ${tiles.length} screens at zoom ${z} (about ${Math.round(tiles.length * 4 / 60)} min). Continue?`)) return;
-      if (!state.skipDone) { state.store.clear(); state.pstore.clear(); }
+      if (!state.skipDone) state.pstore.clear();   // road issues are kept: each one is re-checked when the sweep reaches it
       groups.forEach(g => g.forEach(a => { a.done = false; }));
       const tStart = Date.now();
       let pausedMs = 0;
@@ -1694,14 +1702,15 @@
       const ctx = await buildContext(all);
       const targets = new Map();
       const add = s => { if (s) targets.set(s.id, s); };
-      for (const id of segIds) { const s = ctx.seg.get(id); if (s) { add(s); ends(s).forEach(n => at(ctx, n).forEach(add)); } else state.store.delete(id); }
+      for (const id of segIds) { const s = ctx.seg.get(id); if (s) { add(s); ends(s).forEach(n => at(ctx, n).forEach(add)); } else if (all.length) state.store.delete(id); }   // edited but gone: deleted / replaced
       for (const n of nodeIds) at(ctx, n).forEach(add);
-      for (const id of [...state.store.keys()]) { const s = ctx.seg.get(id); if (s) add(s); else if (all.length) state.store.delete(id); }   // issues already listed: re-check them too
+      for (const id of state.store.keys()) add(ctx.seg.get(id));   // listed issues that are loaded: re-check them; the others stay as they are
       const cands = [...targets.values()];
       if (cands.length) commit(cands, await evaluate(cands, ctx));
       await refreshView();
       saveResultsSoon();
       setStatus(`Edit check: ${cands.length} segments re-validated \u00B7 ${state.view.length} issues`);
+      log.info(`edit check edited=${segIds.length} revalidated=${cands.length} stored=${state.store.size}`);
     } finally {
       liveBusy = false;
       if (liveAgain) { liveAgain = false; scheduleLive(); }
@@ -1721,7 +1730,7 @@
       let missing = 0;
       for (const id of ids) {
         const s = ctx.seg.get(id);
-        if (!s) { state.store.delete(id); missing++; continue; }
+        if (!s) { if (id < 0) state.store.delete(id); missing++; continue; }   // temporary id is replaced by the save; a real id may just be off screen
         targets.set(id, s);
         ends(s).forEach(n => at(ctx, n).forEach(t => targets.set(t.id, t)));   // neighbours: connectivity may have changed
       }
@@ -1733,6 +1742,63 @@
       log.info(`save check ids=${ids.length} revalidated=${cands.length} missing=${missing}`);
       if (missing && state.autoMove) run();         // new segments get new ids after a save: fall back to a normal scan
     } catch (e) { log.error('save check failed', e); }
+  }
+
+  // ---------------------------------------------------- re-check the listed issues
+  // Visits each listed issue, checks it again and removes it only if it is now fixed.
+  const RECHECK_ZOOM = 17;
+  let rechecking = false;
+  async function recheckList() {
+    if (rechecking) { state.sweepCancel = true; return setStatus('Stopping re-check...'); }
+    if (state.sweeping) return setStatus('Stop the sweep first.');
+    if (!state.enabled) return setStatus('Validator off');
+    const queue = new Map(state.view.map(e => [e.id, e]));
+    const total = queue.size;
+    if (!total) return setStatus('No listed issues to re-check.');
+    rechecking = true; state.sweeping = true; state.sweepCancel = false;   // 'sweeping' pauses auto-scan and the edit check while the map moves
+    token++;                                          // drop any scan still running
+    ui.recheckBtn.textContent = 'Stop re-check';
+    ui.scanBtn.disabled = true;
+    let home = null, fixed = 0, still = 0, notFound = 0;
+    try {
+      try { home = { c: await sdk.Map.getMapCenter(), z: await sdk.Map.getZoomLevel() }; } catch (e) { /* no restore */ }
+      while (queue.size && !state.sweepCancel) {
+        while (googleTabOpen() && !state.sweepCancel) { setStatus('Re-check waiting: leave the Google Places tab and it continues.'); await sleep(1000); }
+        if (state.sweepCancel) break;
+        const first = queue.values().next().value;
+        setStatus(`Re-checking ${total - queue.size + 1}/${total} \u00B7 ${fixed} fixed so far`);
+        await sdk.Map.setMapCenter({ lonLat: { lon: first.mid[0], lat: first.mid[1] }, zoomLevel: clampZoom(RECHECK_ZOOM) });
+        await settle();
+        const [all, ext] = await Promise.all([sdk.DataModel.Segments.getAll(), sdk.Map.getMapExtent()]);
+        const ctx = await buildContext(all);
+        const onScreen = e => e.mid[0] >= ext[0] && e.mid[0] <= ext[2] && e.mid[1] >= ext[1] && e.mid[1] <= ext[3];
+        const here = [...queue.values()].filter(e => {   // check every listed issue that is fully loaded on this screen in one go
+          const s = ctx.seg.get(e.id);
+          return e === first || (s && onScreen(e) && neighboursLoaded(s, ctx));
+        });
+        const cands = here.map(e => ctx.seg.get(e.id)).filter(Boolean);
+        if (cands.length) commit(cands, await evaluate(cands, ctx));
+        for (const e of here) {
+          queue.delete(e.id);
+          if (!ctx.seg.has(e.id)) notFound++; else if (state.store.has(e.id)) still++; else fixed++;
+        }
+        await refreshView();
+        saveResultsSoon();
+      }
+    } finally {
+      const stopped = state.sweepCancel;
+      if (home) {                                     // stay paused until the map is back, so an auto-scan does not overwrite the summary
+        try { await sdk.Map.setMapCenter({ lonLat: home.c, zoomLevel: home.z }); await settle(); } catch (e) { log.warn('restore view after re-check', e); }
+      }
+      rechecking = false; state.sweeping = false; state.sweepCancel = false;
+      ui.recheckBtn.textContent = 'Re-check list';
+      ui.scanBtn.disabled = false;
+      await refreshView();
+      saveResults();
+      const msg = `Re-check ${stopped ? 'stopped' : 'done'}: ${fixed} fixed and removed \u00B7 ${still} still have issues${notFound ? ` \u00B7 ${notFound} not found (deleted or not loaded), left in the list` : ''}${queue.size ? ` \u00B7 ${queue.size} not checked` : ''}`;
+      setStatus(msg); log.info(msg);
+      if (liveSegs.size || liveNodes.size) scheduleLive();   // edits made while it ran
+    }
   }
 
   // ------------------------------------------------------------ list view
@@ -2721,6 +2787,8 @@
     ui.nudgeBtn = mkBtn('Refresh map', () => nudgeMap('button'));
     ui.sweepBar = h('div', { style: 'height:6px;background:#e0e0e0;border-radius:3px;margin:4px 0;overflow:hidden' }, h('div', { style: 'height:6px;width:0;background:#1e88e5' }));
     ui.scanBtn = mkBtn('Scan Now', () => scan({ force: true }).catch(onScanError), { style: 'font-weight:bold;padding:3px 10px' });
+    ui.recheckBtn = mkBtn('Re-check list', () => recheckList().catch(e => { log.error('re-check failed', e); setStatus('Re-check error, copy the debug log'); }),
+      { title: 'Visit every listed issue and check it again. Fixed ones are removed, the rest stay.' });
     ui.status = h('div', { style: 'margin:6px 0;color:#555;font-size:12px;min-height:30px' });
 
     ui.pos = h('span', { style: 'font-size:12px;margin:0 6px' });
@@ -2814,7 +2882,7 @@
       mkCheck('Keep results from earlier scans', state.accumulate, v => { state.accumulate = v; }),
       h('div', { style: 'margin-top:6px;font-weight:bold;font-size:12px' }, 'Categories'),
       buildCategories(),
-      h('div', { style: 'margin-top:8px' }, ui.scanBtn, ' ', mkBtn('Clear Highlights', () => clearHighlights())),
+      h('div', { style: 'margin-top:8px' }, ui.scanBtn, ' ', ui.recheckBtn, ' ', mkBtn('Clear Highlights', () => clearHighlights())),
       ui.status, results, mpSection, appearance, debugBox,
     );
     const placesPane = buildPlacesUi();
