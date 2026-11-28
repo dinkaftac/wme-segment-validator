@@ -6,7 +6,7 @@
 // @supportURL   https://github.com/dinkaftac/wme-segment-validator/issues
 // @updateURL    https://raw.githubusercontent.com/dinkaftac/wme-segment-validator/main/wme-segment-validator.user.js
 // @downloadURL  https://raw.githubusercontent.com/dinkaftac/wme-segment-validator/main/wme-segment-validator.user.js
-// @version      0.28.3
+// @version      0.28.4
 // @description  Segment validator: viewport / managed area / driven area / custom polygon (draw or shapefile), save-triggered re-checks, soft highlights under the roads, clickable error list. Official WME SDK only.
 // @match        https://www.waze.com/*/editor*
 // @match        https://beta.waze.com/*/editor*
@@ -23,7 +23,7 @@
 
   const ID = 'wme-segment-validator';
   const NAME = 'Segment Validator';
-  const VERSION = '0.28.3';
+  const VERSION = '0.28.4';
   const LAYER = 'segment-validator-highlights';
   const HALO_LAYER = 'segment-validator-current';   // halo behind the highlight for the focused segment
   const SCOPE_LAYER = 'segment-validator-scope';
@@ -205,7 +205,7 @@
       `User: ${userLine}`,
       `Highlight layer placed under native segments layer: ${state.underRoads}`,
       `Drive areas: source="${state.driveSource}" count=${state.driveAreas ? state.driveAreas.length : 'not loaded'}`,
-      `State: ${JSON.stringify({ enabled: state.enabled, autoMove: state.autoMove, autoSave: state.autoSave, accumulate: state.accumulate, scope: state.scope,
+      `State: ${JSON.stringify({ enabled: state.enabled, autoMove: state.autoMove, autoSave: state.autoSave, accumulate: state.accumulate, skipDone: state.skipDone, scope: state.scope,
         limitToViewport: state.limitToViewport, managedAreasLoaded: state.managedAreas.length, polygons: state.polygons.length,
         stored: state.store.size, shown: state.view.length, enabledRules: Object.keys(state.rules).filter(k => state.rules[k]) })}`,
       '--- SDK API check ---', apiCheck(),
@@ -1392,8 +1392,14 @@
     const areas = areasForKey();
     if (state.scope !== 'area' || !areas.length) return setStatus('Pick a managed, drive or imported area first.');
     let groups = areas.length > 1 ? areas.map(a => [a]) : [areas];      // several areas: one section after another, each marked done when finished
-    if (state.skipDone) groups = groups.filter(g => !g.every(a => a.done));
-    if (!groups.length) return setStatus('Every section here is already swept. Untick "Skip swept sections" to sweep again.');
+    if (state.skipDone) {                             // skip swept sections, but never leave the button doing nothing
+      const todo = groups.filter(g => !g.every(a => a.done));
+      if (todo.length) groups = todo;
+      else if (!window.confirm('Every section here is already swept.\n\nSweep it again to re-check the issues?')) {
+        log.info('sweep not started: already swept, sweep again declined');
+        return setStatus('Already swept. Press Sweep area and choose OK to sweep it again.');
+      } else log.info('sweep again: every selected section was already swept');
+    }
     const z = Math.min(17, Math.max(12, Number(ui.zoomSweep.value) || 14));
     state.sweeping = true; state.sweepCancel = false;
     sweepPrev = { lim: state.limitToViewport, acc: state.accumulate };
@@ -2888,7 +2894,7 @@
         mkBtn('Mark all unswept', async () => { [...state.polygons, ...state.managedAreas, ...(state.driveAreas || [])].forEach(a => { a.done = false; }); await drawScopeOutline(); saveResults(); })),
       ui.here,
       mkCheck('Show section borders and names on the map', state.showSections, async v => { state.showSections = v; await drawBoundaries(); }),
-      mkCheck('Skip sections already swept (this session)', state.skipDone, v => { state.skipDone = v; }),
+      mkCheck('Skip sections already swept', state.skipDone, v => { state.skipDone = v; }),
       mkCheck('Limit to screen viewport (area scopes)', state.limitToViewport, v => { state.limitToViewport = v; run(); }),
       mkCheck('Include Waze map problems (shows WME\'s Map Problems layer so they load)', state.loadMP, async v => {
         state.loadMP = v;
