@@ -6,7 +6,7 @@
 // @supportURL   https://github.com/dinkaftac/wme-segment-validator/issues
 // @updateURL    https://raw.githubusercontent.com/dinkaftac/wme-segment-validator/main/wme-segment-validator.user.js
 // @downloadURL  https://raw.githubusercontent.com/dinkaftac/wme-segment-validator/main/wme-segment-validator.user.js
-// @version      0.28.2
+// @version      0.28.3
 // @description  Segment validator: viewport / managed area / driven area / custom polygon (draw or shapefile), save-triggered re-checks, soft highlights under the roads, clickable error list. Official WME SDK only.
 // @match        https://www.waze.com/*/editor*
 // @match        https://beta.waze.com/*/editor*
