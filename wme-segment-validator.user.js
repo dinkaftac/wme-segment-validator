@@ -23,7 +23,7 @@
 
   const ID = 'wme-segment-validator';
   const NAME = 'Segment Validator';
-  const VERSION = '0.28.2';
+  const VERSION = '0.28.3';
   const LAYER = 'segment-validator-highlights';
   const HALO_LAYER = 'segment-validator-current';   // halo behind the highlight for the focused segment
   const SCOPE_LAYER = 'segment-validator-scope';
@@ -689,7 +689,7 @@
     { id: 'BC_TIE', cat: 'continuity', sev: 'note', on: true, async: true,
       label: 'Best continuation tie at a split: 2+ branches match the incoming road equally, so both get a Keep instruction', test: () => false },
     { id: 'UNCONNECTED', cat: 'topology', sev: 'error', on: true, label: 'Not connected to any other segment',
-      test: (s, c) => s.isDrivable && at(c, s.fromNodeId).length <= 1 && at(c, s.toNodeId).length <= 1 },
+      test: (s, c) => s.isDrivable && degree(c, s.fromNodeId) <= 1 && degree(c, s.toNodeId) <= 1 },
     { id: 'SOFT_TURNS', cat: 'topology', sev: 'topology', on: true, label: 'Unverified (soft) turns',
       test: (s, c) => s.isDrivable &&                // only where a turn exists: the far node must have another drivable segment to leave by
         ((fwdOpen(s) && !s.areFwdTurnsVerified && others(c, s, s.toNodeId).some(t => t.isDrivable && leaves(t, s.toNodeId))) ||
@@ -974,6 +974,10 @@
   function abbrevRe() { try { return state.abbrevPattern ? new RegExp(state.abbrevPattern) : null; } catch (e) { warnOnce('abbrev-regex', e); return null; } }
   const worst = ids => ids.reduce((a, id) => (RANK[TIER[RULE_BY_ID[id].sev]] > RANK[a] ? TIER[RULE_BY_ID[id].sev] : a), 'note');
 
+  const degree = (c, n) => {                        // segments on a node: loaded ones plus those WME's node record lists
+    const rec = n != null && c.nodeRec && c.nodeRec.get(n);
+    return new Set([...at(c, n).map(t => t.id), ...((rec && rec.connectedSegmentIds) || [])]).size;
+  };
   const NAME_RULES = new Set(['NO_NAME', 'NO_STREET_CITY', 'NO_STREET', 'NO_CITY', 'NO_STATE', 'LOWERCASE', 'ABBREV', 'EMPTY_ALT', 'NAME_ROUNDABOUT', 'CLOSED_NAME', 'CITY_RAIL_FWY']);
   const NEIGHBOUR_RULE = r => (r.cat === 'topology' && r.id !== 'LOOP' && r.id !== 'LOOP_SELF') || r.cat === 'continuity' || r.id === 'MEDIAN_UTURN';
   function neighboursLoaded(s, c) {                 // every segment on both end nodes is in the data model
@@ -1002,7 +1006,7 @@
       const full = neighboursLoaded(s, ctx), named = namesKnown(s, ctx);
       if (!full) skipNb++;
       if (!named) { skipNm++; if (nameSkips++ < 3) log.info(`names not resolved for #${s.id}: primaryStreetId=${s.primaryStreetId} alt=${(s.alternateStreetIds || []).join(',')} roadType=${s.roadType}`); }
-      if (!full || !named) out.unknown.set(s.id, { nb: !full, nm: !named });
+      if (!full || !named) out.unknown.set(s.id, { nb: !full, nm: !named, connected: ends(s).some(n => degree(ctx, n) > 1) });
       for (const r of rules) {
         if (!full && NEIGHBOUR_RULE(r)) continue;       // would report phantom dead ends / extra nodes while neighbours are still loading
         if (!named && NAME_RULES.has(r.id)) continue;   // street or city record not loaded yet: unknown, not "missing"
@@ -1231,12 +1235,27 @@
       const old = state.store.get(s.id), un = out.unknown && out.unknown.get(s.id);
       if (old && un) {                             // an issue that could not be re-verified stays listed: not loaded is not the same as fixed
         const kept = old.hits.filter(id => { const r = RULE_BY_ID[id];
-          return r && state.rules[id] && ((un.nb && (NEIGHBOUR_RULE(r) || id === 'SHORT')) || (un.nm && NAME_RULES.has(id))); });
+          return r && state.rules[id] && !(id === 'UNCONNECTED' && un.connected) && ((un.nb && (NEIGHBOUR_RULE(r) || id === 'SHORT')) || (un.nm && NAME_RULES.has(id))); });
         hits = [...new Set([...hits, ...kept])];
       }
       if (hits.length) state.store.set(s.id, { id: s.id, geometry: s.geometry, mid: lineMidpoint(s.geometry.coordinates), rt: s.roadType, hits });
       else state.store.delete(s.id);
     }
+  }
+
+  const GONE_ZOOM = 16;                             // close enough that WME loads the roads on screen
+  async function dropGone() {                       // listed segments whose place is on screen and loaded, but which are not there any more (split, merged, deleted)
+    const [loading, zoom, ext, all] = await Promise.all([sdk.State.isMapLoading(), sdk.Map.getZoomLevel(), sdk.Map.getMapExtent(), sdk.DataModel.Segments.getAll()]);
+    if (loading || zoom < GONE_ZOOM || !all.length) return 0;
+    const have = new Set(all.map(s => s.id));
+    const gone = [...state.store.values()].filter(e => !have.has(e.id) && e.mid[0] >= ext[0] && e.mid[0] <= ext[2] && e.mid[1] >= ext[1] && e.mid[1] <= ext[3]).map(e => e.id);
+    for (const id of gone) { state.store.delete(id); state.visited.delete(id); if (state.currentId === id) state.currentId = null; }
+    if (gone.length) {
+      log.info(`removed ${gone.length} listed segment(s) that no longer exist: ${gone.slice(0, 20).join(',')}`);
+      await sdk.Map.removeAllFeaturesFromLayer({ layerName: HALO_LAYER });
+      saveResultsSoon();
+    }
+    return gone.length;
   }
 
   // --------------------------------------------------------------- scopes
@@ -1647,6 +1666,8 @@
       const out = await evaluate(sel.cands, ctx);
       if (mine !== token) return;
       commit(sel.cands, out);
+      await dropGone();
+      if (mine !== token) return;
       await refreshView();
       const sk = state.skip || {};
       const skipTxt = (sk.nb || sk.nm) ? ` \u00B7 skipped ${sk.nb ? `${sk.nb} neighbours-not-loaded` : ''}${sk.nb && sk.nm ? ', ' : ''}${sk.nm ? `${sk.nm} names-not-loaded` : ''}` : '';
@@ -1707,6 +1728,7 @@
       for (const id of state.store.keys()) add(ctx.seg.get(id));   // listed issues that are loaded: re-check them; the others stay as they are
       const cands = [...targets.values()];
       if (cands.length) commit(cands, await evaluate(cands, ctx));
+      await dropGone();
       await refreshView();
       saveResultsSoon();
       setStatus(`Edit check: ${cands.length} segments re-validated \u00B7 ${state.view.length} issues`);
@@ -1736,6 +1758,7 @@
       }
       const cands = [...targets.values()];
       commit(cands, await evaluate(cands, ctx));
+      await dropGone();
       await refreshView();
       saveResultsSoon();
       setStatus(`Save check: ${cands.length} segments re-validated \u00B7 ${state.view.length} issues`);
@@ -1759,7 +1782,7 @@
     token++;                                          // drop any scan still running
     ui.recheckBtn.textContent = 'Stop re-check';
     ui.scanBtn.disabled = true;
-    let home = null, fixed = 0, still = 0, notFound = 0;
+    let home = null, fixed = 0, still = 0, gone = 0, notFound = 0;
     try {
       try { home = { c: await sdk.Map.getMapCenter(), z: await sdk.Map.getZoomLevel() }; } catch (e) { /* no restore */ }
       while (queue.size && !state.sweepCancel) {
@@ -1778,9 +1801,11 @@
         });
         const cands = here.map(e => ctx.seg.get(e.id)).filter(Boolean);
         if (cands.length) commit(cands, await evaluate(cands, ctx));
+        await dropGone();
         for (const e of here) {
           queue.delete(e.id);
-          if (!ctx.seg.has(e.id)) notFound++; else if (state.store.has(e.id)) still++; else fixed++;
+          if (!ctx.seg.has(e.id)) { if (state.store.has(e.id)) notFound++; else gone++; }
+          else if (state.store.has(e.id)) still++; else fixed++;
         }
         await refreshView();
         saveResultsSoon();
@@ -1795,7 +1820,7 @@
       ui.scanBtn.disabled = false;
       await refreshView();
       saveResults();
-      const msg = `Re-check ${stopped ? 'stopped' : 'done'}: ${fixed} fixed and removed \u00B7 ${still} still have issues${notFound ? ` \u00B7 ${notFound} not found (deleted or not loaded), left in the list` : ''}${queue.size ? ` \u00B7 ${queue.size} not checked` : ''}`;
+      const msg = `Re-check ${stopped ? 'stopped' : 'done'}: ${fixed} fixed and removed \u00B7 ${still} still have issues${gone ? ` \u00B7 ${gone} no longer exist and were removed` : ''}${notFound ? ` \u00B7 ${notFound} could not be loaded, left in the list` : ''}${queue.size ? ` \u00B7 ${queue.size} not checked` : ''}`;
       setStatus(msg); log.info(msg);
       if (liveSegs.size || liveNodes.size) scheduleLive();   // edits made while it ran
     }
@@ -1975,7 +2000,11 @@
       const all = await sdk.DataModel.Segments.getAll();
       const ctx = await buildContext(all);
       const s = ctx.seg.get(id);
-      if (!s) return;                                 // not loaded here: leave the entry alone
+      if (!s) {                                       // gone if its place is on screen and loaded; otherwise leave the entry alone
+        await dropGone();
+        if (!state.store.has(id)) setStatus(`#${id} no longer exists (split, merged or deleted): removed from the list`);
+        return;
+      }
       const targets = new Map([[id, s]]);
       ends(s).forEach(n => at(ctx, n).forEach(t => targets.set(t.id, t)));
       const cands = [...targets.values()];
@@ -2963,8 +2992,16 @@
         const all = await sdk.DataModel.Segments.getAll();
         const seg = all.find(x => String(x.id) === String(id));
         if (!seg) { boxData = null; return placeBox(); }
-        const ctx = await buildContext(all, [seg]);
-        const hits = (await evaluate([seg], ctx)).get(seg.id) || [];
+        let ctx = await buildContext(all, [seg]);
+        const targets = new Map([[seg.id, seg]]);
+        ends(seg).forEach(n => at(ctx, n).forEach(t => targets.set(t.id, t)));
+        ctx = await buildContext(all, [...targets.values()]);
+        const out = await evaluate([...targets.values()], ctx);
+        if (seq !== boxSeq) return;
+        const before = JSON.stringify((state.store.get(seg.id) || {}).hits || []);
+        commit([seg], out);                          // same result in this box and in the list
+        const hits = ((state.store.get(seg.id) || {}).hits || []).filter(h => state.rules[h]);
+        if (JSON.stringify((state.store.get(seg.id) || {}).hits || []) !== before) { await refreshView(); saveResultsSoon(); }
         items = hits.map(h => ({ label: RULE_BY_ID[h].label, hint: HINTS[h] || '', sev: TIER[RULE_BY_ID[h].sev] }));
         title = `Segment Validator: ${items.length ? items.length + ' issue' + (items.length > 1 ? 's' : '') : 'no issues found'}`;
       } else if (type === 'venue') {
